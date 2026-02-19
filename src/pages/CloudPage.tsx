@@ -862,18 +862,30 @@ export default function CloudPage() {
           addLine('output', '⚙️  Installing Node.js...')
           await sh('brew install node')
         } else if (platform === 'linux') {
-          addLine('error', '❌ Node.js is required but not installed.')
-          addLine('error', '')
-          addLine('output', '📥 Please install Node.js using your package manager:')
-          addLine('error', '')
-          addLine('error', '   Ubuntu/Debian:  sudo apt install nodejs npm')
-          addLine('error', '   Fedora:         sudo dnf install nodejs npm')
-          addLine('error', '   Arch:           sudo pacman -S nodejs npm')
-          addLine('error', '')
-          addLine('error', '   Or download from: https://nodejs.org/en/download')
-          addLine('error', '')
-          addLine('error', '   Then restart OverClaw and try again.')
-          return
+          addLine('output', '⚙️  Installing Node.js...')
+          try {
+            // Try NodeSource setup script (works on Ubuntu/Debian)
+            await sh('curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -')
+            await sh('sudo apt-get install -y nodejs')
+            addLine('output', '✅ Node.js installed!')
+          } catch {
+            try {
+              // Fallback: try dnf (Fedora/RHEL)
+              await sh('sudo dnf install -y nodejs npm')
+              addLine('output', '✅ Node.js installed!')
+            } catch {
+              try {
+                // Fallback: try pacman (Arch)
+                await sh('sudo pacman -S --noconfirm nodejs npm')
+                addLine('output', '✅ Node.js installed!')
+              } catch {
+                addLine('error', '❌ Could not auto-install Node.js.')
+                addLine('output', '📥 Please install manually from: https://nodejs.org/en/download')
+                addLine('error', '   Then restart OverClaw and try again.')
+                return
+              }
+            }
+          }
         } else {
           // Windows — auto-install Node.js
           addLine('output', '⚙️  Installing Node.js...')
@@ -956,13 +968,26 @@ export default function CloudPage() {
             }
           }
         } else if (platform === 'linux') {
-          addLine('output', '📥 Please install Git:')
-          addLine('error', '')
-          addLine('error', '   Ubuntu/Debian:  sudo apt install git')
-          addLine('error', '   Fedora:         sudo dnf install git')
-          addLine('error', '   Arch:           sudo pacman -S git')
-          addLine('error', '')
-          addLine('error', '   Then restart OverClaw and try again.')
+          addLine('output', '⚙️  Installing Git...')
+          try {
+            await sh('sudo apt-get install -y git')
+            addLine('output', '✅ Git installed!')
+          } catch {
+            try {
+              await sh('sudo dnf install -y git')
+              addLine('output', '✅ Git installed!')
+            } catch {
+              try {
+                await sh('sudo pacman -S --noconfirm git')
+                addLine('output', '✅ Git installed!')
+              } catch {
+                addLine('error', '❌ Could not auto-install Git.')
+                addLine('output', '📥 Please install manually from: https://git-scm.com')
+                addLine('error', '   Then restart OverClaw and try again.')
+                return
+              }
+            }
+          }
         } else {
           addLine('error', '   Install Xcode Command Line Tools: xcode-select --install')
         }
