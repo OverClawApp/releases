@@ -1,0 +1,50 @@
+appId: com.overclaw.desktop
+productName: OverClaw
+copyright: Copyright © 2026 OverClaw
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - electron/**/*
+  - public/install-agent.sh
+  - "!node_modules/**/*"
+
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+
+win:
+  icon: build/icon.ico
+  target:
+    - nsis
+  
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  icon: build/icons
+  target:
+    - AppImage
+  category: Development
+  maintainer: OverClaw <support@overclaw.app>
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
