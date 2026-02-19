@@ -15,7 +15,7 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --mac --arm64
+      - run: npx electron-builder --mac --arm64 --publish never
         env:
           CSC_LINK: ${{ secrets.MAC_CERT_P12 }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
@@ -38,7 +38,7 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --win --arm64
+      - run: npx electron-builder --win --arm64 --publish never
       - uses: actions/upload-artifact@v4
         with:
           name: win-build
@@ -51,9 +51,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y icnsutils graphicsmagick
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --linux
+      - run: npx electron-builder --linux --publish never
       - uses: actions/upload-artifact@v4
         with:
           name: linux-build
