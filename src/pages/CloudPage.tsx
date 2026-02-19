@@ -1009,7 +1009,23 @@ export default function CloudPage() {
         } catch {}
       }
       try {
-        await api().exec('npm', installArgs, { timeout: 300000 })
+        if (plat === 'linux') {
+          // On Linux, npm install -g often needs sudo or a user-local prefix
+          try {
+            await sh(`sudo npm ${installArgs.join(' ')}`)
+          } catch {
+            // Fallback: set up user-local npm prefix
+            const homedir = await api().getHomedir()
+            const npmDir = `${homedir}/.npm-global`
+            addLine('output', '🔧 Setting up user-local npm directory...')
+            await api().mkdirp(npmDir)
+            await api().exec('npm', ['config', 'set', 'prefix', npmDir], { timeout: 30000 })
+            await sh(`npm ${installArgs.join(' ')}`)
+            addLine('output', `ℹ️  Installed to ${npmDir}/bin — this has been added to PATH`)
+          }
+        } else {
+          await api().exec('npm', installArgs, { timeout: 300000 })
+        }
       } catch (npmErr: any) {
         const npmMsg = npmErr?.message || String(npmErr) || ''
         if (npmMsg.includes('EACCES') || npmMsg.includes('permission')) {
@@ -1036,8 +1052,9 @@ export default function CloudPage() {
       if (msg.includes('spawn git') || msg.includes('path git')) {
         addLine('error', '❌ Git is not installed. Please install Git and restart OverClaw.')
         window.open('https://git-scm.com/downloads', '_blank')
-      } else if (msg.includes('npm warn') && !msg.includes('npm error') && !msg.includes('ERR!')) {
-        // npm warnings on stderr don't mean failure — check if openclaw actually installed
+      } else {
+        // npm warnings on stderr can cause exec to reject even on success
+        // Always check if openclaw actually installed before declaring failure
         try {
           await api().exec('openclaw', ['--version'])
           addLine('output', '')
@@ -1046,12 +1063,10 @@ export default function CloudPage() {
           setTimeout(() => setFlow('setup'), 1000)
           return
         } catch {
-          addLine('error', `❌ Installation failed: ${msg.split('\n')[0]}`)
+          // openclaw genuinely not installed — show the error
+          const firstLine = msg.split('\n').find((l: string) => l.includes('ERR!') || l.includes('error')) || msg.split('\n')[0]
+          addLine('error', `❌ Installation failed: ${firstLine}`)
         }
-      } else {
-        // Show first meaningful line, not the whole npm log
-        const firstLine = msg.split('\n').find((l: string) => l.includes('ERR!') || l.includes('error')) || msg.split('\n')[0]
-        addLine('error', `❌ Installation failed: ${firstLine}`)
       }
     }
   }, [fetchStatus])
