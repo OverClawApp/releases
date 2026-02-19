@@ -117,14 +117,13 @@ const MODELS: Record<string, ModelDef> = {
 type TaskCategory = 'coding-hard' | 'coding-simple' | 'reasoning' | 'math' | 'creative' | 'chat' | 'quick' | 'vision'
 
 const CATEGORY_MODELS: Record<TaskCategory, string[]> = {
-  // Keep high-quality models available, but bias cheaper/faster models first where possible
-  'coding-hard':   ['gpt-4.1', 'claude-sonnet-4', 'gemini-2.5-pro'],
-  'coding-simple': ['kimi-k2', 'gpt-4.1-mini', 'deepseek-chat'],
-  'reasoning':     ['gemini-2.5-pro', 'deepseek-r1', 'gpt-4.1'],
-  'math':          ['deepseek-r1', 'gemini-2.5-pro', 'gpt-4.1'],
-  'creative':      ['gpt-4.1', 'claude-sonnet-4', 'gemini-2.5-pro'],
-  'chat':          ['kimi-k2', 'gemini-2.5-flash', 'deepseek-chat'],
-  'quick':         ['kimi-k2', 'gemini-2.5-flash', 'gpt-4.1-mini'],
+  'coding-hard':   ['claude-sonnet-4', 'gpt-4.1', 'gemini-2.5-pro'],
+  'coding-simple': ['gpt-4.1-mini', 'deepseek-chat', 'kimi-k2'],
+  'reasoning':     ['gemini-2.5-pro', 'deepseek-r1', 'claude-sonnet-4'],
+  'math':          ['deepseek-r1', 'gemini-2.5-pro', 'claude-sonnet-4'],
+  'creative':      ['claude-sonnet-4', 'gpt-4.1', 'gemini-2.5-pro'],
+  'chat':          ['kimi-k2', 'deepseek-chat', 'gemini-2.5-flash'],
+  'quick':         ['gemini-2.5-flash', 'gpt-4.1-mini', 'deepseek-chat'],
   'vision':        ['gemini-2.5-flash', 'gemini-2.5-pro', 'claude-sonnet-4'],
 }
 
@@ -178,13 +177,7 @@ async function classifyTask(messages: any[]): Promise<TaskCategory> {
   if (lower.length < 20 && /^(hi|hey|hello|sup|yo|morning|afternoon|evening|how are|what'?s up)/i.test(lower)) return 'chat'
   if (lower.length < 50 && /^(what is|who is|when did|where is|how many|define|translate)/i.test(lower)) return 'quick'
 
-  // Prevent over-routing to expensive/hard categories for normal dev chat
-  if (/(architecture|system design|refactor\s+entire|multi[-\s]?file|distributed system|performance tuning|big[-\s]?o|algorithmic optimization)/i.test(lower)) {
-    return 'coding-hard'
-  }
-  if (/(code|coding|debug|bug|fix|function|api|react|next\.js|typescript|javascript|python|sql|npm|build|compile|install)/i.test(lower) && lower.length < 320) {
-    return 'coding-simple'
-  }
+  // (no additional heuristics)
 
   try {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -820,15 +813,9 @@ export async function handleProxy(req: Request, res: Response) {
   }
   const { userId } = authResult
 
-  // Balance check
-  // Keep a low floor so users with included monthly tokens (e.g. 2k) can actually chat.
+  // Balance check (no hard preflight gate for chat)
   const balance = await getTokenBalance(userId)
-  // Debug headers to quickly diagnose balance mismatches in clients
   res.setHeader('X-Balance', String(balance))
-  res.setHeader('X-Min-Required', '100')
-  if (balance < 100) {
-    return res.status(402).json({ error: { message: 'Insufficient token balance (need at least 100 tokens).' } })
-  }
 
   // Classify
   const category = await classifyTask(messages)
