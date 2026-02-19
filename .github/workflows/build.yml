@@ -38,7 +38,7 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --win --arm64 --publish never
+      - run: npx electron-builder --win --x64 --arm64 --publish never
         env:
           # Add these repo secrets to enable Windows code signing:
           # WIN_CERT_PFX_BASE64 (base64-encoded .pfx), WIN_CERT_PASSWORD
