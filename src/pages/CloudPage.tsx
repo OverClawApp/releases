@@ -996,8 +996,11 @@ export default function CloudPage() {
 
       addLine('output', '📦 Installing core components...')
       const installArgs = ['install', '-g', 'openclaw', 'clawhub']
-      if (isWin) {
+      const plat = await api().getPlatform()
+      if (isWin || plat === 'linux') {
         installArgs.push('--ignore-scripts')
+      }
+      if (isWin) {
         // Clean up any broken previous install on Windows (EPERM leftover)
         try {
           const homedir = await api().getHomedir()
