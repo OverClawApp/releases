@@ -821,9 +821,10 @@ export async function handleProxy(req: Request, res: Response) {
   const { userId } = authResult
 
   // Balance check
+  // Keep a low floor so users with included monthly tokens (e.g. 2k) can actually chat.
   const balance = await getTokenBalance(userId)
-  if (balance < 2000) {
-    return res.status(402).json({ error: { message: 'Insufficient token balance. Please purchase more tokens.' } })
+  if (balance < 100) {
+    return res.status(402).json({ error: { message: 'Insufficient token balance (need at least 100 tokens).' } })
   }
 
   // Classify
