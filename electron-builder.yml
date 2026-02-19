@@ -34,7 +34,7 @@ nsis:
   allowToChangeInstallationDirectory: true
 
 linux:
-  icon: build/icons
+  icon: build/icon.png
   target:
     - AppImage
   category: Development
