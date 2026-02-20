@@ -71,3 +71,16 @@ export default defineConfig([
   },
 ])
 ```
+
+## OverClaw Website Section
+
+Website work is tracked in the sibling project:
+
+- `../overclaw-website`
+
+Recent website updates include:
+
+- auth redirect hardening (prevents localhost callback on production hosts)
+- chat preflight estimate modal (continue/cancel before request execution)
+- projects page offline popup:
+  - `Desktop offline — connect your desktop app to manage tasks`
