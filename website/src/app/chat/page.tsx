@@ -16,30 +16,12 @@ interface Message {
 
 type DeviceState = "connecting" | "online" | "offline" | "disconnected";
 
-function mergeStreamText(prev: string, incoming: string): string {
-  if (!incoming) return prev;
-  if (!prev) return incoming;
-  if (incoming.startsWith(prev)) return incoming;
-  if (prev.startsWith(incoming)) return prev;
-  return prev + incoming;
-}
-
-function estimateInternalTokenCost(message: string) {
-  const approxInputTokens = Math.max(1, Math.ceil(message.length / 4));
-  const complexity = approxInputTokens > 350 ? "smart" : approxInputTokens > 120 ? "balanced" : "fast";
-  const outputMultiplier = complexity === "smart" ? 3.5 : complexity === "balanced" ? 2.2 : 1.4;
-  const approxOutputTokens = Math.max(16, Math.ceil(approxInputTokens * outputMultiplier));
-  const estimatedInternalTokens = Math.ceil((approxInputTokens * 0.015) + (approxOutputTokens * 0.06));
-  return { complexity, approxInputTokens, approxOutputTokens, estimatedInternalTokens };
-}
-
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [deviceState, setDeviceState] = useState<DeviceState>("connecting");
-  const [pendingConfirm, setPendingConfirm] = useState<null | { text: string; estimate: ReturnType<typeof estimateInternalTokenCost> }>(null);
   const [userInitial, setUserInitial] = useState("U");
   const [userAvatar, setUserAvatar] = useState<string | null>(null);
   const messagesEnd = useRef<HTMLDivElement>(null);
@@ -117,7 +99,7 @@ export default function ChatPage() {
               setDeviceState("offline");
               break;
             case "relay.chat_delta":
-              setStreamText(prev => mergeStreamText(prev, msg.text || ""));
+              setStreamText(msg.text || "");
               setStreaming(true);
               break;
             case "relay.chat_final":
@@ -199,7 +181,7 @@ export default function ChatPage() {
   const handleSend = () => {
     const text = input.trim();
     if (!text || streaming || deviceState !== "online") return;
-    setPendingConfirm({ text, estimate: estimateInternalTokenCost(text) });
+    executeSend(text);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -293,26 +275,6 @@ export default function ChatPage() {
           </div>
         )}
       </div>
-
-      {pendingConfirm && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 80, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-          <div style={{ width: "100%", maxWidth: 430, borderRadius: 14, border: "1px solid var(--border)", background: "var(--card-bg, #111)", padding: 16 }}>
-            <h3 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>Estimated internal token cost</h3>
-            <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 6 }}>
-              Preflight estimate generated with a lightweight model before task execution.
-            </p>
-            <div style={{ marginTop: 12, fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.7 }}>
-              <div>Task tier: <strong>{pendingConfirm.estimate.complexity}</strong></div>
-              <div>Estimated input/output: <strong>{pendingConfirm.estimate.approxInputTokens}</strong> / <strong>{pendingConfirm.estimate.approxOutputTokens}</strong></div>
-              <div>Estimated internal tokens charged: <strong>{pendingConfirm.estimate.estimatedInternalTokens}</strong></div>
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
-              <button onClick={() => setPendingConfirm(null)} style={{ borderRadius: 8, border: "1px solid var(--border)", background: "transparent", color: "var(--text-secondary)", padding: "7px 10px", fontSize: 12 }}>Don't proceed</button>
-              <button onClick={() => { const p = pendingConfirm; setPendingConfirm(null); if (p) executeSend(p.text); }} style={{ borderRadius: 8, border: "none", background: "var(--accent)", color: "#fff", padding: "7px 10px", fontSize: 12 }}>Continue</button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Input */}
       <div style={{ padding: "16px 20px 24px", flexShrink: 0 }}>
