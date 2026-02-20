@@ -2,10 +2,116 @@
 
 import { useState, useEffect } from "react";
 import { supabase } from "@/lib/supabase";
-import { Coins, Activity, Zap, BarChart3, Loader2, Clock, Cpu, ArrowDownRight, ArrowUpRight } from "lucide-react";
+import { Coins, Activity, Zap, BarChart3, Loader2, Clock, Cpu, ArrowUpRight, Bot, GitBranch } from "lucide-react";
+import { supabase as supabaseClient } from "@/lib/supabase";
 
 
 const RAILWAY_URL = "https://overclaw-api-production.up.railway.app";
+
+// --- Agent topology (relay-powered) ---
+
+interface AgentNode {
+  name: string;
+  role: string;
+  emoji: string;
+  status: "online" | "offline";
+}
+
+function useAgentTopology() {
+  const [mainAgent, setMainAgent] = useState<AgentNode | null>(null);
+  const [subAgents, setSubAgents] = useState<AgentNode[]>([]);
+  const [deviceOnline, setDeviceOnline] = useState(false);
+
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let closed = false;
+
+    const connect = async () => {
+      try {
+        const { data: { session } } = await supabaseClient.auth.getSession();
+        if (!session?.access_token) return;
+        const res = await fetch(`${RAILWAY_URL}/api/proxy/apikey`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+        if (!res.ok) return;
+        const { apiKey } = await res.json();
+        if (!apiKey) return;
+
+        ws = new WebSocket(`wss://overclaw-api-production.up.railway.app/ws/web`);
+        const pendingRpc = new Map<string, { resolve: (v: any) => void; reject: (e: any) => void }>();
+        let idCounter = 0;
+
+        const rpc = (method: string, params: any): Promise<any> =>
+          new Promise((resolve, reject) => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return reject(new Error("Not connected"));
+            const rpcId = `rpc_${++idCounter}_${Date.now()}`;
+            pendingRpc.set(rpcId, { resolve, reject });
+            ws.send(JSON.stringify({ type: "relay.rpc_request", rpcId, method, params }));
+            setTimeout(() => { if (pendingRpc.has(rpcId)) { pendingRpc.delete(rpcId); reject(new Error("timeout")); } }, 10000);
+          });
+
+        ws.onopen = () => ws?.send(JSON.stringify({ type: "auth", key: apiKey }));
+        ws.onmessage = async (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "relay.connected") {
+              setDeviceOnline(!!msg.deviceOnline);
+              if (msg.deviceOnline) loadTopology(rpc);
+            }
+            if (msg.type === "relay.device_online") { setDeviceOnline(true); loadTopology(rpc); }
+            if (msg.type === "relay.device_offline") { setDeviceOnline(false); setMainAgent(null); setSubAgents([]); }
+            if (msg.type === "relay.rpc_response" && msg.rpcId) {
+              const p = pendingRpc.get(msg.rpcId);
+              if (p) { pendingRpc.delete(msg.rpcId); msg.error ? p.reject(new Error(msg.error)) : p.resolve(msg.result); }
+            }
+          } catch {}
+        };
+        ws.onclose = () => { if (!closed) setTimeout(connect, 5000); };
+      } catch {}
+    };
+
+    const ROLE_EMOJIS: Record<string, string> = {
+      orchestrator: "🎯", programmer: "💻", artist: "🎨",
+      researcher: "🔍", writer: "✍️", "data-analyst": "📊",
+    };
+
+    async function loadTopology(rpc: (m: string, p: any) => Promise<any>) {
+      // Read main agent SOUL.md to infer role
+      try {
+        const soul = await rpc("exec", { command: "cat ~/.overclaw/cloud/workspace/SOUL.md 2>/dev/null || echo ''" });
+        const soulText = typeof soul === "string" ? soul : soul?.stdout || soul?.output || "";
+        let role = "Custom";
+        let emoji = "🤖";
+        for (const [key, em] of Object.entries(ROLE_EMOJIS)) {
+          if (soulText.toLowerCase().includes(key)) { role = key.charAt(0).toUpperCase() + key.slice(1).replace("-", " "); emoji = em; break; }
+        }
+        setMainAgent({ name: "Main Agent", role, emoji, status: "online" });
+      } catch {
+        setMainAgent({ name: "Main Agent", role: "Unknown", emoji: "🤖", status: "online" });
+      }
+
+      // Read sub-agent registry
+      try {
+        const reg = await rpc("exec", { command: "cat ~/.overclaw/cloud/workspace/subagents/registry.json 2>/dev/null || echo '[]'" });
+        const regText = typeof reg === "string" ? reg : reg?.stdout || reg?.output || "[]";
+        const agents: any[] = JSON.parse(regText);
+        setSubAgents(agents.map((a: any) => ({
+          name: a.name || "Unnamed",
+          role: a.template ? a.template.charAt(0).toUpperCase() + a.template.slice(1).replace("-", " ") : "Custom",
+          emoji: ROLE_EMOJIS[a.template] || "🤖",
+          status: "offline" as const,
+        })));
+      } catch {
+        setSubAgents([]);
+      }
+    }
+
+    connect();
+    return () => { closed = true; ws?.close(); };
+  }, []);
+
+  return { mainAgent, subAgents, deviceOnline };
+}
 
 interface UsageLog {
   id: string;
@@ -32,6 +138,7 @@ const fmtDate = (iso: string) => {
 };
 
 export default function UsagePage() {
+  const { mainAgent, subAgents, deviceOnline } = useAgentTopology();
   const [balance, setBalance] = useState<number | null>(null);
   const [usage, setUsage] = useState<UsageLog[]>([]);
   const [loading, setLoading] = useState(true);
@@ -106,6 +213,104 @@ export default function UsagePage() {
       <p style={{ fontSize: "14px", color: "var(--text-secondary)", marginBottom: "32px" }}>
         Track your token usage and API requests.
       </p>
+
+      {/* Agent Topology */}
+      <div style={{
+        padding: "24px", borderRadius: "16px", marginBottom: "24px",
+        border: "1px solid var(--border)", background: "var(--card-bg, rgba(255,255,255,0.02))",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "20px" }}>
+          <GitBranch size={14} style={{ color: "var(--accent)" }} />
+          <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)" }}>Agent Topology</span>
+          <div style={{
+            marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px",
+          }}>
+            <div style={{ width: "6px", height: "6px", borderRadius: "50%", background: deviceOnline ? "#22C55E" : "#EF4444" }} />
+            <span style={{ fontSize: "11px", color: deviceOnline ? "#22C55E" : "var(--text-muted)" }}>
+              {deviceOnline ? "Desktop connected" : "Desktop offline"}
+            </span>
+          </div>
+        </div>
+
+        {!deviceOnline ? (
+          <div style={{ textAlign: "center", padding: "24px 0" }}>
+            <Bot size={24} style={{ color: "var(--text-muted)", opacity: 0.3, margin: "0 auto 8px" }} />
+            <p style={{ fontSize: "12px", color: "var(--text-muted)" }}>Connect your desktop app to view agent topology</p>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0" }}>
+            {/* Main agent */}
+            {mainAgent && (
+              <div style={{
+                padding: "16px 24px", borderRadius: "14px",
+                border: "2px solid var(--accent)", background: "rgba(239,68,68,0.04)",
+                display: "flex", alignItems: "center", gap: "12px", minWidth: "240px",
+              }}>
+                <span style={{ fontSize: "24px" }}>{mainAgent.emoji}</span>
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: 600, color: "var(--text-primary)" }}>{mainAgent.name}</div>
+                  <div style={{ fontSize: "11px", color: "var(--text-muted)", display: "flex", alignItems: "center", gap: "4px" }}>
+                    <div style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#22C55E" }} />
+                    {mainAgent.role}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Connection lines + sub-agents */}
+            {subAgents.length > 0 && (
+              <>
+                {/* Vertical connector */}
+                <div style={{ width: "2px", height: "20px", background: "var(--border)" }} />
+
+                {/* Horizontal branch bar */}
+                {subAgents.length > 1 && (
+                  <div style={{
+                    height: "2px", background: "var(--border)",
+                    width: `${Math.min(subAgents.length * 160, 640)}px`,
+                    maxWidth: "100%",
+                  }} />
+                )}
+
+                {/* Sub-agent cards */}
+                <div style={{
+                  display: "flex", flexWrap: "wrap", gap: "12px",
+                  justifyContent: "center", marginTop: subAgents.length > 1 ? "0" : "0",
+                }}>
+                  {subAgents.map((agent, i) => (
+                    <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                      {/* Vertical connector from branch */}
+                      {subAgents.length > 1 && (
+                        <div style={{ width: "2px", height: "12px", background: "var(--border)" }} />
+                      )}
+                      <div style={{
+                        padding: "12px 18px", borderRadius: "12px",
+                        border: "1px solid var(--border)", background: "var(--card-bg, rgba(255,255,255,0.02))",
+                        display: "flex", alignItems: "center", gap: "10px", minWidth: "140px",
+                        transition: "border-color 0.2s ease",
+                      }}>
+                        <span style={{ fontSize: "18px" }}>{agent.emoji}</span>
+                        <div>
+                          <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>{agent.name}</div>
+                          <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>{agent.role}</div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {subAgents.length === 0 && mainAgent && (
+              <div style={{ marginTop: "12px" }}>
+                <p style={{ fontSize: "11px", color: "var(--text-muted)", textAlign: "center" }}>
+                  No sub-agents deployed. Add them in <a href="/dashboard/bots" style={{ color: "var(--accent)", textDecoration: "none" }}>Bots</a>.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {error && !loading ? (
         <div style={{
