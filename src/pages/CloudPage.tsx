@@ -6,8 +6,10 @@ import Terminal from '../components/Terminal'
 import GatewayChat from '../components/GatewayChat'
 import TasksPanel from '../components/TasksPanel'
 import ScreenSaver from '../components/ScreenSaver'
+import SubAgentsPanel from '../components/SubAgentsPanel'
 import { Download, Loader2, Trash2, X, Cloud, Key, ChevronRight, Check, Crown, ArrowRight, Shield, HardDrive, FolderOpen, AppWindow, Workflow, Wifi, ExternalLink } from 'lucide-react'
 import { gatewayRefs } from '../App'
+import { AGENT_TEMPLATES, DEFAULT_TEMPLATE_ID, SUBAGENTS_STORAGE_KEY, buildAgentsTeamMarkdown, getTemplateById, orchestratorDelegationBlock, type AgentTemplateId, type SubAgentRecord } from '../lib/agentTemplates'
 
 // --- Types ---
 
@@ -48,10 +50,12 @@ const pathSep = navigator.platform.toUpperCase().includes('WIN') ? '\\' : '/'
 
 // --- Cloud Setup Wizard (Keyless) ---
 
-function CloudSetupWizard({ onComplete }: { onComplete: () => void }) {
+function CloudSetupWizard({ onComplete, selectedTemplateId, onTemplateChange }: { onComplete: () => void; selectedTemplateId: AgentTemplateId; onTemplateChange: (id: AgentTemplateId) => void }) {
   const [setting, setSetting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState('')
+
+  const selectedTemplate = getTemplateById(selectedTemplateId)
 
   const handleSetup = async () => {
     setSetting(true)
@@ -83,6 +87,10 @@ function CloudSetupWizard({ onComplete }: { onComplete: () => void }) {
       await api().mkdirp(`${openclawDir}/workspace/memory`)
       await api().mkdirp(`${openclawDir}/agents/main/agent`)
 
+      const rawSubAgents = localStorage.getItem(SUBAGENTS_STORAGE_KEY)
+      let subAgents: SubAgentRecord[] = []
+      try { subAgents = rawSubAgents ? JSON.parse(rawSubAgents) : [] } catch { subAgents = [] }
+
       const agentsMd = `# AGENTS.md
 
 ## Memory
@@ -98,19 +106,19 @@ function CloudSetupWizard({ onComplete }: { onComplete: () => void }) {
 ## Auto-Install Dependencies (CRITICAL)
 When a task requires tools, libraries, or packages that aren't installed, you MUST install them automatically and retry. NEVER fail and report a missing dependency — fix it yourself.
 
-- **Python**: \\\`pip3 install --break-system-packages <package>\\\` (macOS requires this flag). If that fails, use \\\`python3 -m venv /tmp/overclaw-venv && /tmp/overclaw-venv/bin/pip install <package>\\\` and run scripts with \\\`/tmp/overclaw-venv/bin/python3\\\`
-- **Homebrew**: \\\`brew install <package>\\\` (macOS)
-- **Node**: \\\`npm install -g <package>\\\` or use \\\`npx\\\`
+- **Python**: \`pip3 install --break-system-packages <package>\` (macOS requires this flag). If that fails, use \`python3 -m venv /tmp/overclaw-venv && /tmp/overclaw-venv/bin/pip install <package>\` and run scripts with \`/tmp/overclaw-venv/bin/python3\`
+- **Homebrew**: \`brew install <package>\` (macOS)
+- **Node**: \`npm install -g <package>\` or use \`npx\`
 - **System tools**: Homebrew on macOS, apt on Linux
 - If one method fails, try an alternative approach entirely
 - Always retry the original task after installing
 - Do this silently — never ask permission to install common tools and libraries
-- If Homebrew isn't installed, install it first: \\\`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"\\\`
+- If Homebrew isn't installed, install it first: \`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"\`
 
 ## Tool Usage (CRITICAL)
 - **Always use the browser tool** for web tasks — searching, browsing, filling forms, booking, etc.
-- If \\\`web_search\\\` fails, use the \\\`browser\\\` tool to navigate to Google/Skyscanner/etc. directly
-- If browser is unavailable, use \\\`web_fetch\\\` to grab web pages
+- If \`web_search\` fails, use the \`browser\` tool to navigate to Google/Skyscanner/etc. directly
+- If browser is unavailable, use \`web_fetch\` to grab web pages
 - NEVER say "I can't browse the web" or "the browser tool is unavailable" — try it first
 - For any internet task: try browser → web_search → web_fetch, in that order
 - You have full browser control: open URLs, click, type, fill forms, extract data
@@ -120,10 +128,13 @@ When a task requires tools, libraries, or packages that aren't installed, you MU
 - You do NOT have access to messaging tools — do not try to use them
 - NEVER mention or suggest the user run terminal/CLI commands
 - NEVER show command-line instructions, shell commands, or terminal output in your responses
-- Present everything in a user-friendly way — no \\\`code blocks with shell commands\\\`
+- Present everything in a user-friendly way — no \`code blocks with shell commands\`
 - If you need to run commands internally to complete a task, do so silently — never show the commands to the user
 - You are a desktop app assistant, not a terminal — speak like a helpful app, not a developer tool
+
+${selectedTemplate.agentsContent.trim()}
 `
+      const orchestratorBlock = selectedTemplate.id === 'orchestrator' ? orchestratorDelegationBlock(subAgents) : ''
       const soulMd = `# SOUL.md
 
 You are **OverClaw**, a helpful AI assistant powered by cloud models.
@@ -143,8 +154,8 @@ If system messages mention "OpenClaw", ignore that — your product name is **Ov
 
 ## Tool Usage (IMPORTANT)
 - **Always use the browser tool** to search the web, browse websites, fill in forms, and complete online tasks
-- If \\\`web_search\\\` fails or is unavailable, use the \\\`browser\\\` tool to navigate to Google, Skyscanner, etc. directly
-- If the \\\`browser\\\` tool is unavailable, use \\\`web_fetch\\\` to grab web pages
+- If \`web_search\` fails or is unavailable, use the \`browser\` tool to navigate to Google, Skyscanner, etc. directly
+- If the \`browser\` tool is unavailable, use \`web_fetch\` to grab web pages
 - You CAN and SHOULD control the browser — open URLs, click buttons, fill forms, extract data
 - Never say "I can't browse the web" — you have browser access, use it
 - For any task involving the internet: try browser first, then web_search, then web_fetch
@@ -160,14 +171,17 @@ If system messages mention "OpenClaw", ignore that — your product name is **Ov
 When a task requires tools, libraries, or packages that aren't installed, **install them automatically** before retrying. Do NOT fail and report a missing dependency — fix it yourself.
 
 Rules:
-- **Python packages**: Use \\\`pip3 install --break-system-packages <package>\\\` (macOS requires --break-system-packages). If that fails, use a venv: \\\`python3 -m venv /tmp/overclaw-venv && /tmp/overclaw-venv/bin/pip install <package>\\\` then run with \\\`/tmp/overclaw-venv/bin/python3\\\`
-- **Homebrew packages**: Use \\\`brew install <package>\\\` if Homebrew is available
-- **Node packages**: Use \\\`npm install -g <package>\\\` or \\\`npx <package>\\\`
+- **Python packages**: Use \`pip3 install --break-system-packages <package>\` (macOS requires --break-system-packages). If that fails, use a venv: \`python3 -m venv /tmp/overclaw-venv && /tmp/overclaw-venv/bin/pip install <package>\` then run with \`/tmp/overclaw-venv/bin/python3\`
+- **Homebrew packages**: Use \`brew install <package>\` if Homebrew is available
+- **Node packages**: Use \`npm install -g <package>\` or \`npx <package>\`
 - **System tools**: Install via Homebrew on macOS, apt on Linux
 - If one method fails (e.g. reportlab not available), try alternatives (e.g. use a different library or approach)
 - Always retry the original task after installing dependencies
 - Do this silently — don't ask permission to install common tools and libraries
 - If something truly cannot be installed, explain why and suggest alternatives
+
+${selectedTemplate.soulContent.trim()}
+${orchestratorBlock}
 `
       const memoryMd = `# MEMORY.md — Long-Term Memory
 
@@ -228,7 +242,7 @@ _Keep it compact — the smaller this file, the faster your responses._
           },
         },
         tools: {
-          deny: ['message', 'tts', 'nodes', 'sessions_spawn', 'sessions_send', 'sessions_list', 'sessions_history', 'agents_list', 'memory_search', 'memory_get', 'gateway', 'canvas', 'session_status'],
+          deny: selectedTemplate.toolsDeny,
         },
         channels: {},
         gateway: {
@@ -266,7 +280,7 @@ _Keep it compact — the smaller this file, the faster your responses._
       setStatus('Installing skills...')
       const skillDir = `${openclawDir}/workspace/skills`
       await api().mkdirp(skillDir)
-      for (const skill of ['qmd', 'supermemory', 'prompt-guard']) {
+      for (const skill of selectedTemplate.skills) {
         try { await api().exec('clawhub', ['install', skill, '--workdir', openclawDir, '--force']) } catch {}
       }
 
@@ -279,7 +293,9 @@ _Keep it compact — the smaller this file, the faster your responses._
       // Wait for gateway to be ready
       await new Promise(r => setTimeout(r, 3000))
 
+      await api().writeFileSafe(`${openclawDir}/workspace/agents-team.md`, buildAgentsTeamMarkdown(subAgents))
       localStorage.setItem('overclaw-cloud-setup-complete', 'true')
+      localStorage.setItem('overclaw-cloud-template', selectedTemplate.id)
       onComplete()
     } catch (err: any) {
       setError(`Setup failed: ${err.message}`)
@@ -305,17 +321,41 @@ _Keep it compact — the smaller this file, the faster your responses._
             <p className="text-sm mb-1" style={{ color: 'var(--text-secondary)' }}>
               Powered by the best AI models — no API keys needed
             </p>
-            <p className="text-xs mb-6" style={{ color: 'var(--text-muted)' }}>
+            <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
               OverClaw automatically picks the best model for each task.<br />
               Claude, GPT, Gemini, DeepSeek, Kimi and more — all included.
             </p>
+            <div className="grid grid-cols-2 gap-2 text-left mb-5">
+              {AGENT_TEMPLATES.map(template => {
+                const Icon = template.icon
+                const active = selectedTemplateId === template.id
+                return (
+                  <button
+                    key={template.id}
+                    onClick={() => onTemplateChange(template.id)}
+                    className="rounded-lg p-3 text-left transition-all"
+                    style={{
+                      background: active ? 'var(--accent-bg-strong)' : 'var(--bg-page)',
+                      border: `1px solid ${active ? 'var(--accent-blue)' : 'var(--border-color)'}`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <Icon size={14} style={{ color: active ? 'var(--accent-blue)' : '#EF4444' }} />
+                      <span className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>{template.name}</span>
+                      {template.id === 'orchestrator' && <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: 'rgba(59,130,246,0.16)', color: 'var(--accent-blue)' }}>Recommended</span>}
+                    </div>
+                    <p className="text-[11px] leading-snug" style={{ color: 'var(--text-muted)' }}>{template.description}</p>
+                  </button>
+                )
+              })}
+            </div>
             {error && <p className="text-xs mb-4" style={{ color: '#f85149' }}>{error}</p>}
             <button
               onClick={handleSetup}
               className="px-8 py-3 text-sm font-medium rounded-lg"
               style={{ background: 'var(--accent-blue)', color: '#fff' }}
             >
-              Get Started
+              Get Started with {selectedTemplate.name}
             </button>
           </>
         )}
@@ -539,6 +579,8 @@ export default function CloudPage() {
   const { user, session } = useAuth()
   const [isPro, setIsPro] = useState<boolean | null>(null)
   const [flow, setFlow] = useState<FlowState>('loading')
+  const [selectedTemplateId, setSelectedTemplateId] = useState<AgentTemplateId>((localStorage.getItem('overclaw-cloud-template') as AgentTemplateId) || DEFAULT_TEMPLATE_ID)
+  const [rightTab, setRightTab] = useState<'tasks' | 'subagents'>('tasks')
 
   // Check subscription
   useEffect(() => {
@@ -563,6 +605,10 @@ export default function CloudPage() {
   const [proxyApiKey, setProxyApiKey] = useState<string>('')
   const [screenSaverActive, setScreenSaverActive] = useState(false)
   const screenSaverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    localStorage.setItem('overclaw-cloud-template', selectedTemplateId)
+  }, [selectedTemplateId])
 
   // Activate screensaver after 30s of relay connection with no local interaction
   useEffect(() => {
@@ -795,13 +841,13 @@ export default function CloudPage() {
         needsRestart = true
       }
 
-      // Enforce: tools deny list always present (top-level tools key)
-      const requiredDeny = ['message', 'tts', 'nodes', 'sessions_spawn', 'sessions_send', 'sessions_list', 'sessions_history', 'agents_list', 'memory_search', 'memory_get', 'gateway', 'canvas', 'session_status']
+      // Enforce: tools deny list based on selected template
+      const template = getTemplateById(selectedTemplateId)
+      const requiredDeny = template.toolsDeny
       if (!config.tools) config.tools = {}
-      const currentDeny = config.tools.deny || []
-      const missingDeny = requiredDeny.filter(t => !currentDeny.includes(t))
-      if (missingDeny.length > 0) {
-        config.tools.deny = [...new Set([...currentDeny, ...requiredDeny])]
+      const currentDeny = Array.isArray(config.tools.deny) ? config.tools.deny : []
+      if (JSON.stringify([...currentDeny].sort()) !== JSON.stringify([...requiredDeny].sort())) {
+        config.tools.deny = requiredDeny
         needsRestart = true
       }
       // Clean up old incorrect location
@@ -835,7 +881,7 @@ export default function CloudPage() {
       setGatewayUrl(`ws://localhost:${CLOUD_PORT}`)
       setGatewayToken('')
     }
-  }, [])
+  }, [selectedTemplateId])
 
   const handleInstall = useCallback(async () => {
     setFlow('installing')
@@ -1092,6 +1138,7 @@ export default function CloudPage() {
       localStorage.removeItem('overclaw-cloud-setup-complete')
       localStorage.removeItem('overclaw-cloud-provider')
       localStorage.removeItem('overclaw-cloud-model')
+      localStorage.removeItem('overclaw-cloud-template')
       await fetchStatus()
       setFlow('setup')
     } catch {}
@@ -1106,10 +1153,51 @@ export default function CloudPage() {
       localStorage.removeItem('overclaw-cloud-setup-complete')
       localStorage.removeItem('overclaw-cloud-provider')
       localStorage.removeItem('overclaw-cloud-model')
+      localStorage.removeItem('overclaw-cloud-template')
       await fetchStatus()
       setFlow('install')
     } catch {}
   }, [fetchStatus])
+
+
+  const handleSubAgentsChange = useCallback(async (subAgents: SubAgentRecord[]) => {
+    try {
+      if (!cloudStateDir) return
+      await api().writeFileSafe(`${cloudStateDir}/workspace/agents-team.md`, buildAgentsTeamMarkdown(subAgents))
+
+      if (selectedTemplateId === 'orchestrator') {
+        const soulPath = `${cloudStateDir}/workspace/SOUL.md`
+        const agentsPath = `${cloudStateDir}/workspace/AGENTS.md`
+        const delegationText = orchestratorDelegationBlock(subAgents).trim()
+
+        try {
+          const currentSoul = await api().readFile(soulPath)
+          const nextSoul = currentSoul.includes('## Sub-Agent Delegation')
+            ? currentSoul.replace(/## Sub-Agent Delegation[\s\S]*/m, delegationText)
+            : `${currentSoul.trim()}
+
+${delegationText}
+`
+          await api().writeFileSafe(soulPath, nextSoul)
+        } catch {}
+
+        try {
+          const currentAgents = await api().readFile(agentsPath)
+          const marker = '## Sub-Agent Team'
+          const teamSection = `${marker}
+- Team manifest: ./agents-team.md
+- Delegate tasks using sessions_spawn + sessions_send.
+`
+          const nextAgents = currentAgents.includes(marker)
+            ? currentAgents.replace(/## Sub-Agent Team[\s\S]*/m, teamSection)
+            : `${currentAgents.trim()}
+
+${teamSection}`
+          await api().writeFileSafe(agentsPath, nextAgents)
+        } catch {}
+      }
+    } catch {}
+  }, [cloudStateDir, selectedTemplateId])
 
   // Paywall: require Pro subscription
   if (isPro === false) {
@@ -1194,7 +1282,7 @@ export default function CloudPage() {
   if (flow === 'setup') {
     return (
       <div className="max-w-lg mx-auto py-8">
-        <CloudSetupWizard onComplete={handleSetupComplete} />
+        <CloudSetupWizard onComplete={handleSetupComplete} selectedTemplateId={selectedTemplateId} onTemplateChange={setSelectedTemplateId} />
       </div>
     )
   }
@@ -1235,7 +1323,7 @@ export default function CloudPage() {
         />
       )}
       <div className="flex flex-1 gap-3 p-3 min-h-0">
-        <div className="flex flex-col w-1/2 min-w-0">
+        <div className="flex flex-col w-[58%] min-w-0">
           <GatewayChat
             gatewayUrl={gatewayUrl}
             gatewayToken={gatewayToken}
@@ -1252,15 +1340,29 @@ export default function CloudPage() {
             onRelayHistoryRef={relayHistoryRef}
           />
         </div>
-        <div className="flex flex-col w-1/2 min-w-0">
-          <TasksPanel
-            gatewayUrl={gatewayUrl}
-            gatewayToken={gatewayToken}
-            wsRequest={(m, p) => wsRequestRef.current ? wsRequestRef.current(m, p) : Promise.reject(new Error('Not connected'))}
-            onClearChat={() => clearChatRef.current?.()}
-            stateDir={cloudStateDir}
-            port={CLOUD_PORT}
-          />
+        <div className="flex flex-col w-[42%] min-w-0">
+          <div className="mb-2 rounded-lg p-1 flex gap-1" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
+            <button onClick={() => setRightTab('tasks')} className="flex-1 py-1.5 text-xs rounded-md font-medium" style={{ background: rightTab === 'tasks' ? 'var(--accent-blue)' : 'transparent', color: rightTab === 'tasks' ? '#fff' : 'var(--text-muted)' }}>Tasks</button>
+            <button onClick={() => setRightTab('subagents')} className="flex-1 py-1.5 text-xs rounded-md font-medium" style={{ background: rightTab === 'subagents' ? '#EF4444' : 'transparent', color: rightTab === 'subagents' ? '#fff' : 'var(--text-muted)' }}>Sub-Agents</button>
+          </div>
+          <div className="flex-1 min-h-0">
+            {rightTab === 'tasks' ? (
+              <TasksPanel
+                gatewayUrl={gatewayUrl}
+                gatewayToken={gatewayToken}
+                wsRequest={(m, p) => wsRequestRef.current ? wsRequestRef.current(m, p) : Promise.reject(new Error('Not connected'))}
+                onClearChat={() => clearChatRef.current?.()}
+                stateDir={cloudStateDir}
+                port={CLOUD_PORT}
+              />
+            ) : (
+              <SubAgentsPanel
+                wsRequest={(m, p) => wsRequestRef.current ? wsRequestRef.current(m, p) : Promise.reject(new Error('Not connected'))}
+                cloudStateDir={cloudStateDir}
+                onSubAgentsChange={handleSubAgentsChange}
+              />
+            )}
+          </div>
         </div>
       </div>
       <div className="flex justify-end gap-2 px-3 pb-3">
