@@ -1,3 +1,11 @@
+import * as Sentry from '@sentry/node';
+
+Sentry.init({
+  dsn: 'https://cec64a4e184fabb664f23b08b3fc7989@o4510920689319936.ingest.us.sentry.io/4510920753414144',
+  tracesSampleRate: 0.2,
+  environment: process.env.NODE_ENV,
+});
+
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -1728,6 +1736,8 @@ app.get('/api/relay/status', (_req, res) => {
     totalNodes: Array.from(deviceSockets.values()).reduce((sum, m) => sum + m.size, 0),
   });
 });
+
+Sentry.setupExpressErrorHandler(app);
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
 server.listen(PORT, () => {

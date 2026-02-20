@@ -1,3 +1,5 @@
+require('@sentry/electron/preload')
+
 const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('electronAPI', {

@@ -1,3 +1,11 @@
+const Sentry = require('@sentry/electron/main')
+
+Sentry.init({
+  dsn: 'https://97bcefa14c7e83c31268119b790427fd@o4510920689319936.ingest.us.sentry.io/4510920749809664',
+  tracesSampleRate: process.env.NODE_ENV === 'production' ? 0.2 : 1.0,
+  environment: process.env.NODE_ENV || 'development',
+})
+
 const { app, BrowserWindow, shell, ipcMain, powerSaveBlocker } = require('electron')
 const path = require('path')
 const http = require('http')
