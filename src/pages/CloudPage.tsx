@@ -560,6 +560,7 @@ export default function CloudPage() {
   const relayAbortRef = useRef<(() => void) | null>(null)
   const relayHistoryRef = useRef<((id: string) => void) | null>(null)
   const [relayClient, setRelayClient] = useState<import('../lib/relayClient').RelayClient | null>(null)
+  const [proxyApiKey, setProxyApiKey] = useState<string>('')
   const [screenSaverActive, setScreenSaverActive] = useState(false)
   const screenSaverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -603,6 +604,7 @@ export default function CloudPage() {
         if (!resp.ok || cancelled) return
         const { apiKey } = await resp.json()
         if (!apiKey || cancelled) return
+        setProxyApiKey(apiKey)
 
         const client = new RelayClient(apiKey, {
           onWebMessage: (text, _id) => { relaySendRef.current?.(text) },
@@ -1243,6 +1245,7 @@ export default function CloudPage() {
             stateDir={cloudStateDir}
             title="Chat with cloud agent"
             messagePrefix="[System: Auto-install missing dependencies silently (pip3 install --break-system-packages, brew install, etc). NEVER show terminal commands, shell output, or CLI instructions to the user. NEVER send messages via WhatsApp/Signal/Telegram/email or any messaging platform. Present everything in a clean, user-friendly way. You are a desktop app assistant.]"
+            apiKey={proxyApiKey}
             relay={relayClient}
             onRelaySendRef={relaySendRef}
             onRelayAbortRef={relayAbortRef}

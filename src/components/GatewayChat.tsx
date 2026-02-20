@@ -33,6 +33,7 @@ interface GatewayChatProps {
   stateDir?: string
   title?: string
   messagePrefix?: string
+  apiKey?: string
   relay?: RelayClient | null
   onRelaySendRef?: React.MutableRefObject<((text: string) => void) | null>
   onRelayAbortRef?: React.MutableRefObject<(() => void) | null>
@@ -159,7 +160,9 @@ function extractText(content: any): string | null {
   return null
 }
 
-// --- Preflight Cost Estimate (real LLM call via Ollama) ---
+// --- Preflight Cost Estimate (cheap cloud model via Railway proxy) ---
+
+const PROXY_URL = 'https://overclaw-api-production.up.railway.app'
 
 interface PreflightEstimate {
   costExplanation: string
@@ -169,11 +172,7 @@ interface PreflightEstimate {
   estimatedInternalTokens: number
 }
 
-async function getPreflightEstimate(message: string, stateDir?: string): Promise<PreflightEstimate> {
-  // Use fastest available Ollama model
-  const tiers = await loadModelTiers(stateDir)
-  const fastModel = tiers.find(t => t.role === 'fast')?.id || tiers[0]?.id || 'llama3.2:1b'
-
+async function getPreflightEstimate(message: string, apiKey: string): Promise<PreflightEstimate> {
   const prompt = `You are a task cost estimator for an AI assistant app. Given a user's task, estimate the cost in internal app tokens. Respond ONLY with valid JSON, no other text.
 
 Fields:
@@ -186,19 +185,20 @@ Fields:
 User task: ${message.slice(0, 500)}`
 
   try {
-    const resp = await fetch('http://localhost:11434/api/chat', {
+    const resp = await fetch(`${PROXY_URL}/api/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
-        model: fastModel,
+        model: 'overclaw/auto',
         messages: [{ role: 'user', content: prompt }],
-        stream: false,
-        format: 'json',
+        max_tokens: 300,
       }),
     })
-    if (!resp.ok) throw new Error(`Ollama ${resp.status}`)
+    if (!resp.ok) throw new Error(`Proxy ${resp.status}`)
     const data = await resp.json()
-    const parsed = JSON.parse(data.message?.content || '{}')
+    const content = data.choices?.[0]?.message?.content || '{}'
+    const jsonMatch = content.match(/\{[\s\S]*\}/)
+    const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : content)
     return {
       costExplanation: parsed.costExplanation || 'This task will use a small amount of tokens.',
       plan: parsed.plan || 'The AI will process your request and respond.',
@@ -208,7 +208,6 @@ User task: ${message.slice(0, 500)}`
     }
   } catch (e) {
     console.warn('[GatewayChat] Preflight estimate failed, using fallback:', e)
-    // Fallback heuristic if Ollama is down
     const inputEst = Math.ceil(message.length / 4)
     const outputEst = Math.ceil(inputEst * 2)
     return {
@@ -385,7 +384,7 @@ function saveDeviceToken(deviceId: string, role: string, token: string, scopes: 
 
 // --- Component ---
 
-export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatewayToken = '', sessionKey = 'webchat', onWsReady, clearRef, stateDir, title, messagePrefix, relay, onRelaySendRef, onRelayAbortRef, onRelayHistoryRef }: GatewayChatProps) {
+export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatewayToken = '', sessionKey = 'webchat', onWsReady, clearRef, stateDir, title, messagePrefix, apiKey, relay, onRelaySendRef, onRelayAbortRef, onRelayHistoryRef }: GatewayChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
@@ -829,7 +828,7 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
     // Get real estimate from lightweight model
     setEstimating(true)
     try {
-      const estimate = await getPreflightEstimate(text || currentAttachments.map(a => a.fileName).join(' '), stateDir)
+      const estimate = await getPreflightEstimate(text || currentAttachments.map(a => a.fileName).join(' '), apiKey || '')
       setPendingConfirm({ text, attachments: currentAttachments, estimate })
     } catch (e) {
       console.warn('[GatewayChat] Estimate failed, proceeding directly:', e)
@@ -837,7 +836,7 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
     } finally {
       setEstimating(false)
     }
-  }, [input, attachments, streaming, estimating, wsRequest, sessionKey, stateDir, executeSend])
+  }, [input, attachments, streaming, estimating, wsRequest, sessionKey, apiKey, executeSend])
 
   const abort = useCallback(async () => {
     try { await wsRequest('chat.abort', { sessionKey }) } catch {}
