@@ -5,7 +5,7 @@ import { supabase } from "@/lib/supabase";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { LayoutDashboard, BarChart3, CreditCard, Settings, MessageSquare, LogOut, Menu, PenSquare, Download, FolderOpen, ListTodo, Activity } from "lucide-react";
+import { LayoutDashboard, BarChart3, CreditCard, Settings, MessageSquare, LogOut, Menu, PenSquare, Download, FolderOpen, ListTodo, Activity, Bot } from "lucide-react";
 
 
 const allNavItems = [
@@ -13,6 +13,7 @@ const allNavItems = [
   { href: "/chat", icon: MessageSquare, label: "Chat", proOnly: true },
   { href: "/dashboard/projects", icon: FolderOpen, label: "Projects", proOnly: true },
   { href: "/dashboard/tasks", icon: ListTodo, label: "Tasks", proOnly: true },
+  { href: "/dashboard/bots", icon: Bot, label: "Bots", proOnly: true },
   { href: "/dashboard/activity", icon: Activity, label: "Activity", proOnly: true },
   { href: "/dashboard/usage", icon: BarChart3, label: "Usage", proOnly: true },
   { href: "/dashboard/billing", icon: CreditCard, label: "Billing", proOnly: false },
