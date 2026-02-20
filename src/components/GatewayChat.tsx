@@ -159,6 +159,68 @@ function extractText(content: any): string | null {
   return null
 }
 
+// --- Preflight Cost Estimate (real LLM call via Ollama) ---
+
+interface PreflightEstimate {
+  costExplanation: string
+  plan: string
+  estimatedInputTokens: number
+  estimatedOutputTokens: number
+  estimatedInternalTokens: number
+}
+
+async function getPreflightEstimate(message: string, stateDir?: string): Promise<PreflightEstimate> {
+  // Use fastest available Ollama model
+  const tiers = await loadModelTiers(stateDir)
+  const fastModel = tiers.find(t => t.role === 'fast')?.id || tiers[0]?.id || 'llama3.2:1b'
+
+  const prompt = `You are a task cost estimator for an AI assistant app. Given a user's task, estimate the cost in internal app tokens. Respond ONLY with valid JSON, no other text.
+
+Fields:
+- "costExplanation": One sentence explaining what this task will cost in simple terms
+- "plan": 2-3 sentences describing how the AI will approach this task
+- "estimatedInputTokens": estimated input tokens needed (integer)
+- "estimatedOutputTokens": estimated output tokens the response will use (integer)
+- "estimatedInternalTokens": calculated as ceil((estimatedInputTokens * 0.015) + (estimatedOutputTokens * 0.06))
+
+User task: ${message.slice(0, 500)}`
+
+  try {
+    const resp = await fetch('http://localhost:11434/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: fastModel,
+        messages: [{ role: 'user', content: prompt }],
+        stream: false,
+        format: 'json',
+      }),
+    })
+    if (!resp.ok) throw new Error(`Ollama ${resp.status}`)
+    const data = await resp.json()
+    const parsed = JSON.parse(data.message?.content || '{}')
+    return {
+      costExplanation: parsed.costExplanation || 'This task will use a small amount of tokens.',
+      plan: parsed.plan || 'The AI will process your request and respond.',
+      estimatedInputTokens: parsed.estimatedInputTokens || Math.ceil(message.length / 4),
+      estimatedOutputTokens: parsed.estimatedOutputTokens || Math.ceil(message.length / 2),
+      estimatedInternalTokens: parsed.estimatedInternalTokens || 1,
+    }
+  } catch (e) {
+    console.warn('[GatewayChat] Preflight estimate failed, using fallback:', e)
+    // Fallback heuristic if Ollama is down
+    const inputEst = Math.ceil(message.length / 4)
+    const outputEst = Math.ceil(inputEst * 2)
+    return {
+      costExplanation: 'This task will use a small amount of tokens.',
+      plan: 'The AI will process your request and respond.',
+      estimatedInputTokens: inputEst,
+      estimatedOutputTokens: outputEst,
+      estimatedInternalTokens: Math.ceil((inputEst * 0.015) + (outputEst * 0.06)),
+    }
+  }
+}
+
 function cleanDisplayText(text: string): string {
   // Strip [[reply_to_current]], [[reply_to:<id>]], [[ reply_to_current ]] etc.
   text = text.replace(/\[\[\s*reply_to[^\]]*\]\]/g, '')
@@ -340,6 +402,14 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
   const [thinkingQuote, setThinkingQuote] = useState('')
   const [attachments, setAttachments] = useState<ChatAttachment[]>([])
   const [dragOver, setDragOver] = useState(false)
+  const [pendingConfirm, setPendingConfirm] = useState<null | {
+    text: string
+    attachments: ChatAttachment[]
+    estimate: PreflightEstimate
+  }>(null)
+  const [estimating, setEstimating] = useState(false)
+  const [thoughtText, setThoughtText] = useState('')
+  const [thoughtExpanded, setThoughtExpanded] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const MAX_ATTACHMENTS = 5
@@ -591,8 +661,15 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
           // Agent lifecycle: phase "start" = working, phase "end" = done
           if (p.stream === 'lifecycle' && p.data?.phase === 'start') {
             setStreaming(true)
+          } else if (p.stream && p.stream !== 'lifecycle') {
+            // Capture tool calls, thinking, etc. into thought box
+            const detail = p.data?.text || p.data?.message || p.data?.status || p.data?.name
+            if (detail) {
+              setThoughtText(prev => prev + (prev ? '\n' : '') + `[${p.stream}] ${String(detail)}`)
+              setStreaming(true)
+            }
           } else if (p.stream === 'lifecycle' && p.data?.phase === 'end') {
-            setStreaming(false); setStreamText(''); runIdRef.current = null; fetchHistory()
+            setStreaming(false); setStreamText(''); setThoughtText(''); setThoughtExpanded(false); runIdRef.current = null; fetchHistory()
             // Send the final response to relay by fetching latest from history
             if (relayRef.current) {
               wsRequest('chat.history', { sessionKey, limit: 5 }).then((result: any) => {
@@ -614,7 +691,9 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
           if (p.state === 'delta') {
             const text = extractText(p.message)
             if (text !== null) {
-              setStreamText(text); setStreaming(true)
+              // Route deltas to thought box — only final goes in chat
+              setThoughtText(text)
+              setStreaming(true)
               relayRef.current?.sendDelta(text)
             }
           } else if (p.state === 'final') {
@@ -656,15 +735,9 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
 
   const [activeModel, setActiveModel] = useState<string | null>(null)
 
-  const send = useCallback(async () => {
-    const text = input.trim()
-    const hasAttachments = attachments.length > 0
-    if ((!text && !hasAttachments) || streaming) return
-    const lower = text.toLowerCase()
-    if (lower === '/stop' || lower === 'stop' || lower === 'abort') {
-      try { await wsRequest('chat.abort', { sessionKey }) } catch {}
-      setInput(''); return
-    }
+  // Execute the actual send after user confirms preflight estimate
+  const executeSend = useCallback(async (text: string, currentAttachments: ChatAttachment[]) => {
+    const hasAttachments = currentAttachments.length > 0
 
     // Auto-route to the right model based on complexity
     try {
@@ -683,26 +756,21 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
       console.warn('[GatewayChat] Model routing failed, using default:', e)
     }
 
-    // Build attachment display info for the local message
-    const currentAttachments = [...attachments]
     const displayAttachments = currentAttachments.map(a => ({ mimeType: a.mimeType, fileName: a.fileName, dataUrl: a.dataUrl }))
-
     const userContent = text || (hasAttachments ? `📎 ${currentAttachments.map(a => a.fileName).join(', ')}` : '')
     const userAttachments = displayAttachments.length > 0 ? displayAttachments : undefined
-    // Store attachments persistently for history refresh matching
     if (userAttachments?.length && userContent) {
       attachmentStoreRef.current.set(userContent.slice(0, 80), userAttachments)
       saveAttachmentStore()
     }
     setMessages(prev => [...prev, { role: 'user', content: userContent, attachments: userAttachments, timestamp: Date.now() }])
-    setInput(''); setAttachments([]); setStreaming(true); setStreamText('')
+    setInput(''); setAttachments([]); setStreaming(true); setStreamText(''); setThoughtText(''); setThoughtExpanded(false)
     setThinkingQuote(THINKING_QUOTES[Math.floor(Math.random() * THINKING_QUOTES.length)])
     const idempotencyKey = uuid()
     runIdRef.current = idempotencyKey
     const fullMessage = messagePrefix ? `${messagePrefix}\n\n${text}` : text
 
     // Save all attachments to workspace uploads dir
-    // Images: agent uses `image` tool to analyze | Files: agent uses `read` tool
     let messageWithFiles = fullMessage
     const savedImages: string[] = []
     const savedDocs: string[] = []
@@ -739,18 +807,41 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
     }
 
     try {
-      const params: any = { sessionKey, message: messageWithFiles, deliver: false, idempotencyKey }
-      await wsRequest('chat.send', params)
+      await wsRequest('chat.send', { sessionKey, message: messageWithFiles, deliver: false, idempotencyKey })
     } catch (err: any) {
-      setStreaming(false); setStreamText(''); runIdRef.current = null
+      setStreaming(false); setStreamText(''); setThoughtText(''); runIdRef.current = null
       setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${err.message}`, timestamp: Date.now() }])
     }
-  }, [input, attachments, streaming, wsRequest, sessionKey, activeModel])
+  }, [wsRequest, sessionKey, messagePrefix, stateDir, activeModel, saveAttachmentStore])
+
+  // Send: get preflight estimate first, then show confirmation modal
+  const send = useCallback(async () => {
+    const text = input.trim()
+    const currentAttachments = [...attachments]
+    const hasAttachments = currentAttachments.length > 0
+    if ((!text && !hasAttachments) || streaming || estimating) return
+    const lower = text.toLowerCase()
+    if (lower === '/stop' || lower === 'stop' || lower === 'abort') {
+      try { await wsRequest('chat.abort', { sessionKey }) } catch {}
+      setInput(''); return
+    }
+
+    // Get real estimate from lightweight model
+    setEstimating(true)
+    try {
+      const estimate = await getPreflightEstimate(text || currentAttachments.map(a => a.fileName).join(' '), stateDir)
+      setPendingConfirm({ text, attachments: currentAttachments, estimate })
+    } catch (e) {
+      console.warn('[GatewayChat] Estimate failed, proceeding directly:', e)
+      await executeSend(text, currentAttachments)
+    } finally {
+      setEstimating(false)
+    }
+  }, [input, attachments, streaming, estimating, wsRequest, sessionKey, stateDir, executeSend])
 
   const abort = useCallback(async () => {
     try { await wsRequest('chat.abort', { sessionKey }) } catch {}
-    // Clear streaming state immediately so UI is responsive even if server is slow
-    setStreaming(false); setStreamText(''); runIdRef.current = null
+    setStreaming(false); setStreamText(''); setThoughtText(''); setThoughtExpanded(false); runIdRef.current = null
     fetchHistory()
   }, [wsRequest, sessionKey, fetchHistory])
 
@@ -852,6 +943,57 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
         </div>
       )}
 
+      {/* Preflight cost estimate modal */}
+      {pendingConfirm && (
+        <div className="absolute inset-0 z-[60] flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.55)' }}>
+          <div className="w-[440px] rounded-xl p-5" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
+            <h3 className="text-sm font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>Cost Estimate</h3>
+            <p className="text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              {pendingConfirm.estimate.costExplanation}
+            </p>
+            <div className="mt-3 px-3 py-2 rounded-lg text-xs leading-relaxed" style={{ background: 'var(--bg-page)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)' }}>
+              <div className="font-medium mb-1" style={{ color: 'var(--text-primary)' }}>Plan</div>
+              {pendingConfirm.estimate.plan}
+            </div>
+            <div className="mt-3 flex items-center gap-4 text-xs" style={{ color: 'var(--text-secondary)' }}>
+              <div>Input: <strong>{pendingConfirm.estimate.estimatedInputTokens}</strong></div>
+              <div>Output: <strong>{pendingConfirm.estimate.estimatedOutputTokens}</strong></div>
+              <div>Est. cost: <strong>{pendingConfirm.estimate.estimatedInternalTokens} tokens</strong></div>
+            </div>
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                className="px-3 py-1.5 rounded-lg text-xs"
+                style={{ background: 'transparent', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', cursor: 'pointer' }}
+                onClick={() => setPendingConfirm(null)}
+              >
+                Don&apos;t proceed
+              </button>
+              <button
+                className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                style={{ background: 'var(--accent-blue)', color: '#fff', border: 'none', cursor: 'pointer' }}
+                onClick={async () => {
+                  const p = pendingConfirm
+                  setPendingConfirm(null)
+                  if (p) await executeSend(p.text, p.attachments)
+                }}
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Estimating indicator */}
+      {estimating && (
+        <div className="absolute inset-0 z-[60] flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.35)' }}>
+          <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
+            <Loader2 size={14} className="animate-spin" style={{ color: 'var(--accent-teal)' }} />
+            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Estimating cost...</span>
+          </div>
+        </div>
+      )}
+
       <div className="px-4 py-3 flex items-center gap-2 shrink-0" style={{ borderBottom: '1px solid var(--border-color)' }}>
         <Bot size={16} style={{ color: 'var(--accent-teal)' }} />
         <span className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>{title || 'Chat with local agent'}</span>
@@ -923,15 +1065,28 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
             <div className="w-6 h-6 rounded-full flex items-center justify-center shrink-0" style={{ background: 'var(--accent-bg-strong)' }}>
               <Bot size={12} style={{ color: 'var(--accent-teal)' }} />
             </div>
-            <div className="max-w-[85%]">
-              {streamText ? (
-                <div className="px-3 py-2 rounded-xl text-[13px] leading-relaxed whitespace-pre-wrap" style={{ background: 'var(--bg-page)', border: '1px solid var(--border-color)', color: 'var(--text-primary)' }}>
-                  {cleanDisplayText(streamText)}
-                </div>
-              ) : (
-                <div className="px-3 py-2 rounded-xl flex flex-col items-center gap-2" style={{ background: 'var(--bg-page)', border: '1px solid var(--border-color)' }}>
-                  <Loader2 size={16} className="animate-spin" style={{ color: 'var(--accent-teal)' }} />
-                  <span className="text-[11px] italic" style={{ color: 'var(--text-muted)' }}>"{thinkingQuote}"</span>
+            <div className="max-w-[85%] w-full">
+              {/* Loading spinner with thinking quote */}
+              <div className="px-3 py-2 rounded-xl flex flex-col items-center gap-2" style={{ background: 'var(--bg-page)', border: '1px solid var(--border-color)' }}>
+                <Loader2 size={16} className="animate-spin" style={{ color: 'var(--accent-teal)' }} />
+                <span className="text-[11px] italic" style={{ color: 'var(--text-muted)' }}>"{thinkingQuote}"</span>
+              </div>
+              {/* Thought/process box — shows live streaming content */}
+              {thoughtText && (
+                <div className="mt-1.5 rounded-lg overflow-hidden" style={{ border: '1px solid var(--border-color)', background: 'var(--bg-page)' }}>
+                  <button
+                    onClick={() => setThoughtExpanded(prev => !prev)}
+                    className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium"
+                    style={{ color: 'var(--text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
+                  >
+                    <span style={{ transform: thoughtExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s', display: 'inline-block' }}>▶</span>
+                    Thinking & Process
+                  </button>
+                  {thoughtExpanded && (
+                    <div className="px-2.5 pb-2 text-[11px] leading-relaxed whitespace-pre-wrap" style={{ color: 'var(--text-muted)', maxHeight: '200px', overflowY: 'auto', fontFamily: 'monospace' }}>
+                      {thoughtText}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
