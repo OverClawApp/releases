@@ -10,6 +10,9 @@ import SubAgentsPanel from '../components/SubAgentsPanel'
 import { Download, Loader2, Trash2, X, Cloud, Key, ChevronRight, Check, Crown, ArrowRight, Shield, HardDrive, FolderOpen, AppWindow, Workflow, Wifi, ExternalLink } from 'lucide-react'
 import { gatewayRefs } from '../App'
 import { AGENT_TEMPLATES, DEFAULT_TEMPLATE_ID, SUBAGENTS_STORAGE_KEY, buildAgentsTeamMarkdown, getTemplateById, orchestratorDelegationBlock, type AgentTemplateId, type SubAgentRecord } from '../lib/agentTemplates'
+import { getOrCreateGatewayPort } from '../lib/gatewayPort'
+import { DEFAULT_RATE_LIMITS, SECURITY_TIERS, tierToConfigPatch, type RateLimitConfig, type SecurityTier } from '../lib/securityTiers'
+import { generateFirewallScript, generateSSHHardeningScript } from '../lib/sshHardening'
 
 // --- Types ---
 
@@ -20,7 +23,6 @@ const PROXY_BASE_URL = import.meta.env.VITE_API_URL || 'https://overclaw-api-pro
 const isElectron = !!window.electronAPI?.isElectron
 
 const CLOUD_SUBDIR = '.overclaw/cloud'
-const CLOUD_PORT = 18790
 
 const api = () => window.electronAPI!
 
@@ -65,6 +67,7 @@ function CloudSetupWizard({ onComplete, selectedTemplateId, onTemplateChange }: 
       const homedir = await getHome()
       const openclawDir = cloudDir(homedir)
       const env = ocEnv(homedir)
+      const cloudPort = getOrCreateGatewayPort('overclaw-cloud-port')
 
       setStatus('Fetching API key...')
       
@@ -247,7 +250,7 @@ _Keep it compact — the smaller this file, the faster your responses._
         channels: {},
         gateway: {
           mode: 'local',
-          port: CLOUD_PORT,
+          port: cloudPort,
           bind: 'loopback',
           controlUi: { allowInsecureAuth: true },
           auth: { mode: 'token', token },
@@ -285,10 +288,10 @@ _Keep it compact — the smaller this file, the faster your responses._
       }
 
       // Stop any existing cloud gateway on this port
-      try { await api().killPort(CLOUD_PORT) } catch {}
+      try { await api().killPort(cloudPort) } catch {}
 
       // Start gateway in background
-      await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(CLOUD_PORT)], { OPENCLAW_STATE_DIR: openclawDir }, `${openclawDir}/gateway.log`)
+      await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(cloudPort)], { OPENCLAW_STATE_DIR: openclawDir }, `${openclawDir}/gateway.log`)
 
       // Wait for gateway to be ready
       await new Promise(r => setTimeout(r, 3000))
@@ -582,6 +585,11 @@ export default function CloudPage() {
   const [selectedTemplateId, setSelectedTemplateId] = useState<AgentTemplateId>((localStorage.getItem('overclaw-cloud-template') as AgentTemplateId) || DEFAULT_TEMPLATE_ID)
   const [rightTab, setRightTab] = useState<'tasks' | 'subagents'>('tasks')
   const [nodeId, setNodeId] = useState<string>(localStorage.getItem('overclaw-node-id') || 'node-1')
+  const [cloudPort] = useState<number>(() => getOrCreateGatewayPort('overclaw-cloud-port'))
+  const [securityTier, setSecurityTier] = useState<SecurityTier>(() => (localStorage.getItem(`overclaw-node-${localStorage.getItem('overclaw-node-id') || 'node-1'}-tier`) as SecurityTier) || 'standard')
+  const [rateLimitOverride, setRateLimitOverride] = useState(false)
+  const [customRateLimit, setCustomRateLimit] = useState<RateLimitConfig>(DEFAULT_RATE_LIMITS.standard)
+  const [showSshModal, setShowSshModal] = useState(false)
 
   // Check subscription
   useEffect(() => {
@@ -590,7 +598,7 @@ export default function CloudPage() {
     }).catch(() => setIsPro(false))
   }, [user])
   const [installLines, setInstallLines] = useState<{ type: 'output' | 'error' | 'complete'; data: string; command: string }[]>([])
-  const [gatewayUrl, setGatewayUrl] = useState(`ws://localhost:${CLOUD_PORT}`)
+  const [gatewayUrl, setGatewayUrl] = useState(`ws://localhost:${cloudPort}`)
   const [gatewayToken, setGatewayToken] = useState('')
   const [showConfirmReset, setShowConfirmReset] = useState(false)
   const [showConfirmUninstall, setShowConfirmUninstall] = useState(false)
@@ -613,6 +621,17 @@ export default function CloudPage() {
 
   useEffect(() => {
     localStorage.setItem('overclaw-node-id', nodeId)
+    const storedTier = (localStorage.getItem(`overclaw-node-${nodeId}-tier`) as SecurityTier) || 'standard'
+    setSecurityTier(storedTier)
+    try {
+      const raw = localStorage.getItem('overclaw-node-ratelimits')
+      const map = raw ? JSON.parse(raw) : {}
+      setCustomRateLimit(map[nodeId] || DEFAULT_RATE_LIMITS[storedTier])
+      setRateLimitOverride(!!map[nodeId])
+    } catch {
+      setCustomRateLimit(DEFAULT_RATE_LIMITS[storedTier])
+      setRateLimitOverride(false)
+    }
   }, [nodeId])
 
   // Activate screensaver after 30s of relay connection with no local interaction
@@ -737,7 +756,7 @@ export default function CloudPage() {
               console.log(`[Relay] Resumed project: ${projectName}`)
             } catch (e) { console.error('[Relay] Resume failed:', e) }
           },
-        }, nodeId)
+        }, nodeId, cloudPort, securityTier)
         client.connect()
         setRelayClient(client)
       } catch (e) {
@@ -748,7 +767,7 @@ export default function CloudPage() {
       cancelled = true
       setRelayClient(prev => { prev?.destroy(); return null })
     }
-  }, [flow, user, session, nodeId])
+  }, [flow, user, session, nodeId, cloudPort, securityTier])
 
   const initialCheckDone = useRef(false)
   useEffect(() => {
@@ -794,7 +813,7 @@ export default function CloudPage() {
       // Config exists — check if gateway is running on cloud port
       let gatewayReachable = false
       try {
-        const resp = await fetch(`http://127.0.0.1:${CLOUD_PORT}/`)
+        const resp = await fetch(`http://127.0.0.1:${cloudPort}/`)
         gatewayReachable = resp.ok || resp.status > 0
       } catch {}
 
@@ -804,8 +823,8 @@ export default function CloudPage() {
       } else {
         try {
           // Kill anything on cloud port, then start gateway in background
-          try { await api().killPort(CLOUD_PORT) } catch {}
-          await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(CLOUD_PORT)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`)
+          try { await api().killPort(cloudPort) } catch {}
+          await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(cloudPort)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`)
           await new Promise(r => setTimeout(r, 3000))
           await loadGatewayAuth()
           setFlow('ready')
@@ -825,7 +844,7 @@ export default function CloudPage() {
       const raw = await api().readFile(`${dir}/openclaw.json`)
       const config = JSON.parse(raw)
       const token = config?.gateway?.auth?.token || ''
-      const port = config?.gateway?.port || CLOUD_PORT
+      const port = config?.gateway?.port || cloudPort
       setGatewayUrl(`ws://localhost:${port}`)
       setGatewayToken(token)
 
@@ -873,8 +892,8 @@ export default function CloudPage() {
           try { await sh(`chmod 444 "${dir}/openclaw.json"`) } catch {}
         }
         // Restart cloud gateway
-        try { await api().killPort(CLOUD_PORT) } catch {}
-        try { await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(CLOUD_PORT)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`) } catch {}
+        try { await api().killPort(cloudPort) } catch {}
+        try { await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(cloudPort)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`) } catch {}
         await new Promise(r => setTimeout(r, 3000))
       } else {
         // Ensure config is read-only (Unix only)
@@ -883,7 +902,7 @@ export default function CloudPage() {
         }
       }
     } catch {
-      setGatewayUrl(`ws://localhost:${CLOUD_PORT}`)
+      setGatewayUrl(`ws://localhost:${cloudPort}`)
       setGatewayToken('')
     }
   }, [selectedTemplateId])
@@ -1138,7 +1157,7 @@ export default function CloudPage() {
     setShowConfirmReset(false)
     try {
       const homedir = await getHome()
-      try { await api().killPort(CLOUD_PORT) } catch {}
+      try { await api().killPort(cloudPort) } catch {}
       try { await sh(`rm -rf "${cloudDir(homedir)}"`) } catch {}
       localStorage.removeItem('overclaw-cloud-setup-complete')
       localStorage.removeItem('overclaw-cloud-provider')
@@ -1153,7 +1172,7 @@ export default function CloudPage() {
     setShowConfirmUninstall(false)
     try {
       const homedir = await getHome()
-      try { await api().killPort(CLOUD_PORT) } catch {}
+      try { await api().killPort(cloudPort) } catch {}
       try { await sh(`rm -rf "${cloudDir(homedir)}"`) } catch {}
       localStorage.removeItem('overclaw-cloud-setup-complete')
       localStorage.removeItem('overclaw-cloud-provider')
@@ -1164,6 +1183,36 @@ export default function CloudPage() {
     } catch {}
   }, [fetchStatus])
 
+
+  const applySecurityTier = useCallback(async (tier: SecurityTier) => {
+    setSecurityTier(tier)
+    localStorage.setItem(`overclaw-node-${nodeId}-tier`, tier)
+    try {
+      const patch = tierToConfigPatch(tier) as any
+      const homedir = await getHome()
+      const dir = cloudDir(homedir)
+      const raw = await api().readFile(`${dir}/openclaw.json`)
+      const config = JSON.parse(raw)
+      config.tools = { ...(config.tools || {}), ...(patch.tools || {}) }
+      await api().writeFileSafe(`${dir}/openclaw.json`, JSON.stringify(config, null, 2))
+      try { await api().killPort(cloudPort) } catch {}
+      await api().startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(cloudPort)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`)
+      relayClient?.sendStatus('idle')
+      ;(relayClient as any)?.send?.({ type: 'relay.security_update', nodeId, tier, rateLimits: rateLimitOverride ? customRateLimit : DEFAULT_RATE_LIMITS[tier], gatewayPort: cloudPort })
+    } catch (e) {
+      console.warn('Failed to apply security tier', e)
+    }
+  }, [nodeId, cloudPort, relayClient, rateLimitOverride, customRateLimit])
+
+  const persistRateLimits = useCallback((cfg: RateLimitConfig) => {
+    setCustomRateLimit(cfg)
+    const key = 'overclaw-node-ratelimits'
+    const raw = localStorage.getItem(key)
+    const map = raw ? JSON.parse(raw) : {}
+    if (rateLimitOverride) map[nodeId] = cfg
+    else delete map[nodeId]
+    localStorage.setItem(key, JSON.stringify(map))
+  }, [nodeId, rateLimitOverride])
 
   const handleSubAgentsChange = useCallback(async (subAgents: SubAgentRecord[]) => {
     try {
@@ -1346,6 +1395,42 @@ ${teamSection}`
           ))}
         </div>
       </div>
+      {showSshModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={() => setShowSshModal(false)}>
+          <div className="w-[760px] max-w-[95vw] rounded-xl p-4" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }} onClick={e => e.stopPropagation()}>
+            <h3 className="text-sm font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>SSH Hardening Script</h3>
+            <pre className="text-xs p-3 rounded-lg max-h-[50vh] overflow-auto" style={{ background: 'var(--bg-page)', color: 'var(--text-secondary)', border: '1px solid var(--border-color)' }}>{generateSSHHardeningScript()}{"\n"}{generateFirewallScript(cloudPort)}</pre>
+            <div className="flex justify-end gap-2 mt-3">
+              <button onClick={() => setShowSshModal(false)} className="px-3 py-1.5 text-xs rounded" style={{ border: '1px solid var(--border-color)', color: 'var(--text-muted)' }}>Close</button>
+              <button onClick={async () => {
+                const ws = wsRequestRef.current
+                if (!ws) return
+                await ws('exec', { command: `${generateSSHHardeningScript()}\n${generateFirewallScript(cloudPort)}` })
+                setShowSshModal(false)
+              }} className="px-3 py-1.5 text-xs rounded" style={{ border: '1px solid rgba(245,158,11,0.6)', color: '#F59E0B' }}>Run Harden SSH</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="px-3">
+        <div className="rounded-lg p-3 mt-2" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
+          <div className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>Security</div>
+          <div className="grid grid-cols-4 gap-2 mb-3">
+            {(Object.keys(SECURITY_TIERS) as SecurityTier[]).map((tier) => {
+              const t = SECURITY_TIERS[tier]
+              const selected = securityTier === tier
+              return <button key={tier} onClick={() => applySecurityTier(tier)} className="text-left p-2 rounded-lg" style={{ border: `1px solid ${selected ? t.color : 'var(--border-color)'}`, background: selected ? `${t.color}33` : 'transparent' }}><div className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>{t.icon} {t.label}</div><div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{t.description}</div></button>
+            })}
+          </div>
+          <div className="flex items-center gap-4 text-xs" style={{ color: 'var(--text-secondary)' }}>
+            <label><input type="checkbox" checked={rateLimitOverride} onChange={(e) => setRateLimitOverride(e.target.checked)} className="mr-1" />Custom rate limits</label>
+            <span>Commands/min: {customRateLimit.maxCommandsPerMinute}</span>
+            <span>Tokens/hr: {customRateLimit.maxTokensPerHour}</span>
+            <span>Gateway Port: <code style={{ fontFamily: 'monospace' }}>{cloudPort}</code></span>
+            <button onClick={() => setShowSshModal(true)} className="px-2 py-1 rounded" style={{ border: '1px solid rgba(245,158,11,0.6)', color: '#F59E0B' }}>Harden SSH</button>
+          </div>
+        </div>
+      </div>
       <div className="flex flex-1 gap-3 p-3 min-h-0">
         <div className="flex flex-col w-[58%] min-w-0">
           <GatewayChat
@@ -1377,7 +1462,7 @@ ${teamSection}`
                 wsRequest={(m, p) => wsRequestRef.current ? wsRequestRef.current(m, p) : Promise.reject(new Error('Not connected'))}
                 onClearChat={() => clearChatRef.current?.()}
                 stateDir={cloudStateDir}
-                port={CLOUD_PORT}
+                port={cloudPort}
               />
             ) : (
               <SubAgentsPanel

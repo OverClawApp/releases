@@ -6,6 +6,7 @@ import GatewayChat from '../components/GatewayChat'
 import { gatewayRefs } from '../App'
 import TasksPanel from '../components/TasksPanel'
 import { Download, Loader2, Trash2, X, Info, Zap, Plus, HardDrive, Monitor } from 'lucide-react'
+import { getOrCreateGatewayPort } from '../lib/gatewayPort'
 
 type FlowState = 'loading' | 'install' | 'installing' | 'uninstalling' | 'setup' | 'ready'
 
@@ -264,7 +265,8 @@ export default function LocalPage() {
   const { status, loading, fetchStatus } = useOpenClawContext()
   const [flow, setFlow] = useState<FlowState>('loading')
   const [installLines, setInstallLines] = useState<{ type: 'output' | 'error' | 'complete'; data: string; command: string }[]>([])
-  const [gatewayUrl, setGatewayUrl] = useState('ws://localhost:18789')
+  const [localPort] = useState<number>(() => getOrCreateGatewayPort('overclaw-local-port'))
+  const [gatewayUrl, setGatewayUrl] = useState(`ws://localhost:${localPort}`)
   const [gatewayToken, setGatewayToken] = useState('')
   const [localStateDir, setLocalStateDir] = useState('')
   const [showPerfPopup, setShowPerfPopup] = useState(false)
@@ -309,7 +311,7 @@ export default function LocalPage() {
       try {
         const raw = window.electronAPI?.readFile ? await window.electronAPI.readFile(`${dir}/openclaw.json`) : await sh(`cat "${dir}/openclaw.json"`)
         const config = JSON.parse(raw)
-        const port = config?.gateway?.port || 18789
+        const port = config?.gateway?.port || localPort
         const resp = await fetch(`http://127.0.0.1:${port}/`)
         if (resp.ok || resp.status < 500) gatewayReachable = true
       } catch {}
@@ -320,14 +322,14 @@ export default function LocalPage() {
       } else {
         try {
           if (window.electronAPI?.killPort) {
-            try { await window.electronAPI.killPort(18789) } catch {}
+            try { await window.electronAPI.killPort(localPort) } catch {}
           } else {
-            try { await sh('lsof -ti:18789 | xargs kill -9 2>/dev/null || true') } catch {}
+            try { await sh('lsof -ti:${localPort} | xargs kill -9 2>/dev/null || true') } catch {}
           }
           if (window.electronAPI?.startGatewayDetached) {
-            await window.electronAPI.startGatewayDetached('openclaw', ['gateway', 'run', '--port', '18789'], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`)
+            await window.electronAPI.startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(localPort)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`)
           } else {
-            await sh(`${env} nohup openclaw gateway run --port 18789 > "${dir}/gateway.log" 2>&1 &`)
+            await sh(`${env} nohup openclaw gateway run --port ${localPort} > "${dir}/gateway.log" 2>&1 &`)
           }
           await new Promise(r => setTimeout(r, 3000))
           await loadGatewayAuth()
@@ -360,7 +362,7 @@ export default function LocalPage() {
       const raw = ea.readFile ? await ea.readFile(`${dir}/openclaw.json`) : await sh(`cat "${dir}/openclaw.json"`)
       const config = JSON.parse(raw)
       const token = config?.gateway?.auth?.token || ''
-      const port = config?.gateway?.port || 18789
+      const port = config?.gateway?.port || localPort
       setGatewayUrl(`ws://localhost:${port}`)
       setGatewayToken(token)
 
@@ -377,19 +379,19 @@ export default function LocalPage() {
           await sh(`mv ${tmpConfig} "${dir}/openclaw.json"`)
         }
         if (ea.killPort) {
-          try { await ea.killPort(18789) } catch {}
+          try { await ea.killPort(localPort) } catch {}
         } else {
-          try { await sh('lsof -ti:18789 | xargs kill -9 2>/dev/null || true') } catch {}
+          try { await sh('lsof -ti:${localPort} | xargs kill -9 2>/dev/null || true') } catch {}
         }
         if (ea.startGatewayDetached) {
-          try { await ea.startGatewayDetached('openclaw', ['gateway', 'run', '--port', '18789'], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`) } catch {}
+          try { await ea.startGatewayDetached('openclaw', ['gateway', 'run', '--port', String(localPort)], { OPENCLAW_STATE_DIR: dir }, `${dir}/gateway.log`) } catch {}
         } else {
-          try { await sh(`${env} nohup openclaw gateway run --port 18789 > "${dir}/gateway.log" 2>&1 &`) } catch {}
+          try { await sh(`${env} nohup openclaw gateway run --port ${localPort} > "${dir}/gateway.log" 2>&1 &`) } catch {}
         }
         await new Promise(r => setTimeout(r, 3000))
       }
     } catch {
-      setGatewayUrl('ws://localhost:18789')
+      setGatewayUrl(`ws://localhost:${localPort}`)
       setGatewayToken('')
     }
   }, [])
@@ -469,9 +471,9 @@ export default function LocalPage() {
       const env = ocEnv(homedir)
       addLine('output', '🛑 Stopping local agent...')
       if (window.electronAPI?.killPort) {
-        try { await window.electronAPI.killPort(18789) } catch {}
+        try { await window.electronAPI.killPort(localPort) } catch {}
       } else {
-        try { await sh('lsof -ti:18789 | xargs kill -9 2>/dev/null || true') } catch {}
+        try { await sh('lsof -ti:${localPort} | xargs kill -9 2>/dev/null || true') } catch {}
       }
 
       addLine('output', '🗑️  Removing configuration...')

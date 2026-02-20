@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Zap, CheckCircle2, Loader2, Download, HardDrive, Cpu } from 'lucide-react'
+import { getOrCreateGatewayPort } from '../lib/gatewayPort'
 
 interface SetupWizardProps {
   onComplete: () => void
@@ -423,7 +424,7 @@ _Keep it compact — the smaller this file, the faster your responses._
       },
       gateway: {
         mode: 'local',
-        port: 18789,
+        port: getOrCreateGatewayPort('overclaw-local-port'),
         bind: 'loopback',
         controlUi: { allowInsecureAuth: true },
         auth: { mode: 'token', token },
@@ -455,10 +456,10 @@ _Keep it compact — the smaller this file, the faster your responses._
 
     setConfigStatus('Starting gateway...')
     // Kill any existing gateway on local port
-    try { await ea.killPort(18789) } catch {}
+    try { await ea.killPort(getOrCreateGatewayPort('overclaw-local-port')) } catch {}
 
     // Start gateway in background with state dir
-    await ea.startGatewayDetached(oc, ['gateway', 'run', '--port', '18789'], { OPENCLAW_STATE_DIR: openclawDir }, `${openclawDir}/gateway.log`)
+    await ea.startGatewayDetached(oc, ['gateway', 'run', '--port', String(getOrCreateGatewayPort('overclaw-local-port'))], { OPENCLAW_STATE_DIR: openclawDir }, `${openclawDir}/gateway.log`)
     await new Promise(r => setTimeout(r, 2000))
     setConfigStatus('Done!')
   }

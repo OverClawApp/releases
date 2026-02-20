@@ -3,9 +3,11 @@
  */
 
 import { decrypt, deriveSharedKey, encrypt, generateKeyPair } from './relayCrypto';
+import { DEFAULT_RATE_LIMITS, type RateLimitConfig, type SecurityTier } from './securityTiers';
 
 const RELAY_URL = 'wss://overclaw-api-production.up.railway.app/ws/device';
 const PLAIN_FIELDS = new Set(['type', 'sourceNodeId', 'targetNodeId', 'id', 'rpcId', 'publicKey']);
+const RATE_LIMITS_KEY = 'overclaw-node-ratelimits';
 
 export interface ProjectTask {
   title: string;
@@ -36,17 +38,23 @@ export class RelayClient {
   private connected = false;
   private destroyed = false;
   private nodeId: string;
+  private gatewayPort?: number;
+  private securityTier: SecurityTier = 'standard';
 
   private ownPrivateKey: CryptoKey | null = null;
   private ownPublicJwk: JsonWebKey | null = null;
   private sharedKey: CryptoKey | null = null;
   private pendingOutbound: any[] = [];
   private pendingInbound: any[] = [];
+  private minuteWindowStart = Date.now();
+  private minuteCount = 0;
 
-  constructor(apiKey: string, callbacks: RelayCallbacks, nodeId: string = 'node-1') {
+  constructor(apiKey: string, callbacks: RelayCallbacks, nodeId: string = 'node-1', gatewayPort?: number, securityTier: SecurityTier = 'standard') {
     this.apiKey = apiKey;
     this.callbacks = callbacks;
     this.nodeId = nodeId || 'node-1';
+    this.gatewayPort = gatewayPort;
+    this.securityTier = securityTier;
   }
 
   connect() {
@@ -63,7 +71,7 @@ export class RelayClient {
 
     this.ws.addEventListener('open', () => {
       console.log('[Relay] WebSocket open');
-      this.ws?.send(JSON.stringify({ type: 'auth', key: this.apiKey, nodeId: this.nodeId }));
+      this.ws?.send(JSON.stringify({ type: 'auth', key: this.apiKey, nodeId: this.nodeId, gatewayPort: this.gatewayPort, securityTier: this.securityTier }));
     });
 
     this.ws.addEventListener('message', async (ev) => {
@@ -100,7 +108,22 @@ export class RelayClient {
       if (!decrypted) return;
 
       if (decrypted.type === 'relay.send') {
+        if (!this.consumeRateLimit()) {
+          this.send({ type: 'relay.chat_error', message: 'Rate limit exceeded', id: decrypted.id || '' });
+          return;
+        }
         this.callbacks.onWebMessage(decrypted.text || '', decrypted.id || '');
+        return;
+      }
+
+      if (decrypted.type === 'relay.security_change') {
+        this.send({
+          type: 'relay.security_update',
+          nodeId: this.nodeId,
+          tier: decrypted.tier || this.securityTier,
+          rateLimits: this.getRateLimitConfig(),
+          gatewayPort: this.gatewayPort,
+        });
         return;
       }
 
@@ -159,6 +182,29 @@ export class RelayClient {
     });
   }
 
+  private getRateLimitConfig(): RateLimitConfig {
+    try {
+      const raw = localStorage.getItem(RATE_LIMITS_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed[this.nodeId] || DEFAULT_RATE_LIMITS[this.securityTier] || DEFAULT_RATE_LIMITS.standard;
+    } catch {
+      return DEFAULT_RATE_LIMITS[this.securityTier] || DEFAULT_RATE_LIMITS.standard;
+    }
+  }
+
+  private consumeRateLimit(): boolean {
+    const limits = this.getRateLimitConfig();
+    if (!limits?.enabled) return true;
+    const now = Date.now();
+    if (now - this.minuteWindowStart >= 60_000) {
+      this.minuteWindowStart = now;
+      this.minuteCount = 0;
+    }
+    if (this.minuteCount >= limits.maxCommandsPerMinute) return false;
+    this.minuteCount += 1;
+    return true;
+  }
+
   private async startKeyExchange() {
     const kp = await generateKeyPair();
     this.ownPrivateKey = kp.privateKey;
@@ -181,7 +227,6 @@ export class RelayClient {
     for (const m of queued) {
       const decrypted = await this.decryptPayload(m);
       if (!decrypted) continue;
-      // re-handle through message event path not needed here; queue only used before first key and only for supported types
       if (decrypted.type === 'relay.send') this.callbacks.onWebMessage(decrypted.text || '', decrypted.id || '');
       else if (decrypted.type === 'relay.abort') this.callbacks.onWebAbort();
       else if (decrypted.type === 'relay.history_request') this.callbacks.onWebHistoryRequest(decrypted.id || '');

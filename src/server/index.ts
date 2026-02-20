@@ -1386,35 +1386,43 @@ async function authenticateRelayHttp(req: express.Request): Promise<string | nul
 }
 
 // Maps:
-// deviceSockets: userId → (nodeId → ws)
+interface NodeConnection {
+  ws: WebSocket;
+  nodeId: string;
+  gatewayPort?: number;
+  securityTier?: string;
+}
+
+// deviceSockets: userId → (nodeId → connection)
 // webSockets: userId → Set<ws>
-const deviceSockets = new Map<string, Map<string, WebSocket>>();
+const deviceSockets = new Map<string, Map<string, NodeConnection>>();
 const webSockets = new Map<string, Set<WebSocket>>();
 
-function getOnlineNodeIds(userId: string): string[] {
+function getOnlineNodes(userId: string): Array<{ nodeId: string; online: boolean; gatewayPort?: number; securityTier?: string }> {
   const nodes = deviceSockets.get(userId);
   if (!nodes) return [];
-  const out: string[] = [];
-  for (const [nodeId, ws] of nodes.entries()) {
-    if (ws.readyState === WebSocket.OPEN) out.push(nodeId);
+  const out: Array<{ nodeId: string; online: boolean; gatewayPort?: number; securityTier?: string }> = [];
+  for (const [nodeId, conn] of nodes.entries()) {
+    out.push({ nodeId, online: conn.ws.readyState === WebSocket.OPEN, gatewayPort: conn.gatewayPort, securityTier: conn.securityTier });
   }
   return out;
 }
 
-function setDeviceSocket(userId: string, nodeId: string, ws: WebSocket) {
+function setDeviceSocket(userId: string, nodeId: string, ws: WebSocket, gatewayPort?: number, securityTier?: string) {
   if (!deviceSockets.has(userId)) deviceSockets.set(userId, new Map());
   const byNode = deviceSockets.get(userId)!;
   const existing = byNode.get(nodeId);
-  if (existing && existing !== ws) {
-    try { existing.close(); } catch {}
+  if (existing && existing.ws !== ws) {
+    try { existing.ws.close(); } catch {}
   }
-  byNode.set(nodeId, ws);
+  byNode.set(nodeId, { ws, nodeId, gatewayPort, securityTier });
 }
 
 function removeDeviceSocket(userId: string, nodeId: string, ws: WebSocket) {
   const byNode = deviceSockets.get(userId);
   if (!byNode) return;
-  if (byNode.get(nodeId) === ws) byNode.delete(nodeId);
+  const conn = byNode.get(nodeId);
+  if (conn?.ws === ws) byNode.delete(nodeId);
   if (byNode.size === 0) deviceSockets.delete(userId);
 }
 
@@ -1444,17 +1452,17 @@ function sendToAllDeviceNodes(userId: string, msg: any) {
   const byNode = deviceSockets.get(userId);
   if (!byNode) return;
   const payload = typeof msg === 'string' ? msg : JSON.stringify(msg);
-  for (const ws of byNode.values()) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  for (const conn of byNode.values()) {
+    if (conn.ws.readyState === WebSocket.OPEN) conn.ws.send(payload);
   }
 }
 
 function sendToDeviceNode(userId: string, nodeId: string, msg: any): boolean {
   const byNode = deviceSockets.get(userId);
   if (!byNode) return false;
-  const ws = byNode.get(nodeId);
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg));
+  const conn = byNode.get(nodeId);
+  if (!conn || conn.ws.readyState !== WebSocket.OPEN) return false;
+  conn.ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg));
   return true;
 }
 
@@ -1462,7 +1470,7 @@ function sendToDeviceNode(userId: string, nodeId: string, msg: any): boolean {
 app.get('/api/relay/nodes', async (req, res) => {
   const userId = await authenticateRelayHttp(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const nodes = getOnlineNodeIds(userId).map(nodeId => ({ nodeId, online: true }));
+  const nodes = getOnlineNodes(userId);
   res.json({ ok: true, nodes });
 });
 
@@ -1477,13 +1485,13 @@ wssDevice.on('connection', (ws, req) => {
   let authenticated = false;
   let nodeId = urlNodeId || 'node-1';
 
-  const finishAuth = (uid: string, incomingNodeId?: string) => {
+  const finishAuth = (uid: string, incomingNodeId?: string, gatewayPort?: number, securityTier?: string) => {
     userId = uid;
     authenticated = true;
     nodeId = incomingNodeId || nodeId || 'node-1';
-    setDeviceSocket(uid, nodeId, ws);
-    ws.send(JSON.stringify({ type: 'relay.connected', userId: uid, nodeId }));
-    sendToAllWeb(uid, { type: 'relay.node_online', nodeId });
+    setDeviceSocket(uid, nodeId, ws, gatewayPort, securityTier);
+    ws.send(JSON.stringify({ type: 'relay.connected', userId: uid, nodeId, gatewayPort, securityTier }));
+    sendToAllWeb(uid, { type: 'relay.node_online', nodeId, gatewayPort, securityTier });
     console.log(`[Relay] Device connected: user=${uid} node=${nodeId}`);
   };
 
@@ -1496,10 +1504,21 @@ wssDevice.on('connection', (ws, req) => {
     let msg: any;
     try { msg = JSON.parse(String(raw)); } catch { return; }
 
+    if (authenticated && msg.type === 'auth' && userId) {
+      const byNode = deviceSockets.get(userId);
+      const conn = byNode?.get(nodeId);
+      if (conn) {
+        conn.gatewayPort = msg.gatewayPort ?? conn.gatewayPort;
+        conn.securityTier = msg.securityTier ?? conn.securityTier;
+      }
+      sendToAllWeb(userId, { type: 'relay.security_update', nodeId, tier: msg.securityTier, gatewayPort: msg.gatewayPort });
+      return;
+    }
+
     if (!authenticated && msg.type === 'auth') {
       authenticateRelay(msg.key).then(uid => {
         if (!uid) return ws.send(JSON.stringify({ type: 'relay.error', message: 'Invalid API key' }));
-        finishAuth(uid, msg.nodeId || urlNodeId || 'node-1');
+        finishAuth(uid, msg.nodeId || urlNodeId || 'node-1', msg.gatewayPort, msg.securityTier);
       });
       return;
     }
@@ -1520,6 +1539,18 @@ wssDevice.on('connection', (ws, req) => {
         payload: msg.payload,
       });
       if (!delivered) ws.send(JSON.stringify({ type: 'relay.error', message: `Target node offline: ${toNodeId}` }));
+      return;
+    }
+
+    if (msg.type === 'relay.security_update') {
+      const byNode = deviceSockets.get(userId);
+      const conn = byNode?.get(nodeId);
+      if (conn) {
+        conn.gatewayPort = msg.gatewayPort ?? conn.gatewayPort;
+        conn.securityTier = msg.tier ?? msg.securityTier ?? conn.securityTier;
+      }
+      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || nodeId };
+      sendToAllWeb(userId, outbound);
       return;
     }
 
@@ -1551,7 +1582,7 @@ wssWeb.on('connection', (ws, req) => {
     userId = uid;
     authenticated = true;
     addWebSocket(uid, ws);
-    const nodes = getOnlineNodeIds(uid).map(nodeId => ({ nodeId, online: true }));
+    const nodes = getOnlineNodes(uid);
     ws.send(JSON.stringify({ type: 'relay.connected', userId: uid, nodes, deviceOnline: nodes.length > 0 }));
     console.log(`[Relay] Web connected: user=${uid} nodes=${nodes.length}`);
   };
