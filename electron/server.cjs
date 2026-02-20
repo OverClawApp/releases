@@ -41198,9 +41198,7 @@ async function handleProxy(req, res) {
   }
   const { userId } = authResult;
   const balance = await getTokenBalance(userId);
-  if (balance < 2e3) {
-    return res.status(402).json({ error: { message: "Insufficient token balance. Please purchase more tokens." } });
-  }
+  res.setHeader("X-Balance", String(balance));
   const category = await classifyTask(messages);
   const candidates = getCandidateModels(category);
   if (candidates.length === 0) {
@@ -48010,44 +48008,101 @@ async function authenticateRelay(apiKey) {
     return null;
   }
 }
+async function authenticateRelayHttp(req) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  return token ? authenticateRelay(token) : null;
+}
 var deviceSockets = /* @__PURE__ */ new Map();
 var webSockets = /* @__PURE__ */ new Map();
-function addToMap(map, userId, ws) {
-  if (!map.has(userId)) map.set(userId, /* @__PURE__ */ new Set());
-  map.get(userId).add(ws);
+function getOnlineNodeIds(userId) {
+  const nodes = deviceSockets.get(userId);
+  if (!nodes) return [];
+  const out = [];
+  for (const [nodeId, ws] of nodes.entries()) {
+    if (ws.readyState === import_websocket.default.OPEN) out.push(nodeId);
+  }
+  return out;
 }
-function removeFromMap(map, userId, ws) {
-  const set = map.get(userId);
+function setDeviceSocket(userId, nodeId, ws) {
+  if (!deviceSockets.has(userId)) deviceSockets.set(userId, /* @__PURE__ */ new Map());
+  const byNode = deviceSockets.get(userId);
+  const existing = byNode.get(nodeId);
+  if (existing && existing !== ws) {
+    try {
+      existing.close();
+    } catch {
+    }
+  }
+  byNode.set(nodeId, ws);
+}
+function removeDeviceSocket(userId, nodeId, ws) {
+  const byNode = deviceSockets.get(userId);
+  if (!byNode) return;
+  if (byNode.get(nodeId) === ws) byNode.delete(nodeId);
+  if (byNode.size === 0) deviceSockets.delete(userId);
+}
+function addWebSocket(userId, ws) {
+  if (!webSockets.has(userId)) webSockets.set(userId, /* @__PURE__ */ new Set());
+  webSockets.get(userId).add(ws);
+}
+function removeWebSocket(userId, ws) {
+  const set = webSockets.get(userId);
   if (set) {
     set.delete(ws);
-    if (set.size === 0) map.delete(userId);
+    if (set.size === 0) webSockets.delete(userId);
   }
 }
-function sendToAll(map, userId, msg) {
-  const set = map.get(userId);
+function sendToAllWeb(userId, msg) {
+  const set = webSockets.get(userId);
   if (!set) return;
   const payload = typeof msg === "string" ? msg : JSON.stringify(msg);
   for (const ws of set) {
     if (ws.readyState === import_websocket.default.OPEN) ws.send(payload);
   }
 }
+function sendToAllDeviceNodes(userId, msg) {
+  const byNode = deviceSockets.get(userId);
+  if (!byNode) return;
+  const payload = typeof msg === "string" ? msg : JSON.stringify(msg);
+  for (const ws of byNode.values()) {
+    if (ws.readyState === import_websocket.default.OPEN) ws.send(payload);
+  }
+}
+function sendToDeviceNode(userId, nodeId, msg) {
+  const byNode = deviceSockets.get(userId);
+  if (!byNode) return false;
+  const ws = byNode.get(nodeId);
+  if (!ws || ws.readyState !== import_websocket.default.OPEN) return false;
+  ws.send(typeof msg === "string" ? msg : JSON.stringify(msg));
+  return true;
+}
+app.get("/api/relay/nodes", async (req, res) => {
+  const userId = await authenticateRelayHttp(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+  const nodes = getOnlineNodeIds(userId).map((nodeId) => ({ nodeId, online: true }));
+  res.json({ ok: true, nodes });
+});
 var wssDevice = new import_websocket_server.default({ noServer: true });
 wssDevice.on("connection", (ws, req) => {
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
   const apiKey = url.searchParams.get("key") || "";
+  const urlNodeId = url.searchParams.get("nodeId") || "node-1";
   let userId = null;
   let authenticated = false;
+  let nodeId = urlNodeId || "node-1";
+  const finishAuth = (uid, incomingNodeId) => {
+    userId = uid;
+    authenticated = true;
+    nodeId = incomingNodeId || nodeId || "node-1";
+    setDeviceSocket(uid, nodeId, ws);
+    ws.send(JSON.stringify({ type: "relay.connected", userId: uid, nodeId }));
+    sendToAllWeb(uid, { type: "relay.node_online", nodeId });
+    console.log(`[Relay] Device connected: user=${uid} node=${nodeId}`);
+  };
   authenticateRelay(apiKey).then((uid) => {
-    if (uid) {
-      userId = uid;
-      authenticated = true;
-      addToMap(deviceSockets, userId, ws);
-      ws.send(JSON.stringify({ type: "relay.connected", userId }));
-      sendToAll(webSockets, userId, { type: "relay.device_online" });
-      console.log(`[Relay] Device connected: user=${userId}`);
-    } else {
-      ws.send(JSON.stringify({ type: "relay.error", message: 'Authentication required. Send: {"type":"auth","key":"oc_..."}' }));
-    }
+    if (uid) finishAuth(uid, urlNodeId);
+    else ws.send(JSON.stringify({ type: "relay.error", message: 'Authentication required. Send: {"type":"auth","key":"oc_..."}' }));
   });
   ws.on("message", (raw) => {
     let msg;
@@ -48058,32 +48113,39 @@ wssDevice.on("connection", (ws, req) => {
     }
     if (!authenticated && msg.type === "auth") {
       authenticateRelay(msg.key).then((uid) => {
-        if (uid) {
-          userId = uid;
-          authenticated = true;
-          addToMap(deviceSockets, userId, ws);
-          ws.send(JSON.stringify({ type: "relay.connected", userId }));
-          sendToAll(webSockets, userId, { type: "relay.device_online" });
-          console.log(`[Relay] Device authenticated: user=${userId}`);
-        } else {
-          ws.send(JSON.stringify({ type: "relay.error", message: "Invalid API key" }));
-        }
+        if (!uid) return ws.send(JSON.stringify({ type: "relay.error", message: "Invalid API key" }));
+        finishAuth(uid, msg.nodeId || urlNodeId || "node-1");
       });
       return;
     }
     if (!authenticated || !userId) return;
-    console.log(`[Relay] Device msg: user=${userId} type=${msg.type}`);
+    if (msg.type === "relay.node_message") {
+      const fromNodeId = msg.fromNodeId || msg.sourceNodeId || nodeId;
+      const toNodeId = msg.toNodeId;
+      if (!toNodeId) {
+        ws.send(JSON.stringify({ type: "relay.error", message: "relay.node_message requires toNodeId" }));
+        return;
+      }
+      const delivered = sendToDeviceNode(userId, toNodeId, {
+        type: "relay.node_message",
+        fromNodeId,
+        toNodeId,
+        payload: msg.payload
+      });
+      if (!delivered) ws.send(JSON.stringify({ type: "relay.error", message: `Target node offline: ${toNodeId}` }));
+      return;
+    }
     if (msg.type?.startsWith("relay.")) {
-      const webCount = webSockets.get(userId)?.size || 0;
-      console.log(`[Relay] Forwarding ${msg.type} to ${webCount} web clients`);
-      sendToAll(webSockets, userId, msg);
+      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || nodeId };
+      sendToAllWeb(userId, outbound);
     }
   });
   ws.on("close", () => {
     if (userId) {
-      removeFromMap(deviceSockets, userId, ws);
-      sendToAll(webSockets, userId, { type: "relay.device_offline" });
-      console.log(`[Relay] Device disconnected: user=${userId}`);
+      const closedNodeId = nodeId || "node-1";
+      removeDeviceSocket(userId, closedNodeId, ws);
+      sendToAllWeb(userId, { type: "relay.node_offline", nodeId: closedNodeId });
+      console.log(`[Relay] Device disconnected: user=${userId} node=${closedNodeId}`);
     }
   });
 });
@@ -48093,17 +48155,17 @@ wssWeb.on("connection", (ws, req) => {
   const apiKey = url.searchParams.get("key") || "";
   let userId = null;
   let authenticated = false;
+  const finishAuth = (uid) => {
+    userId = uid;
+    authenticated = true;
+    addWebSocket(uid, ws);
+    const nodes = getOnlineNodeIds(uid).map((nodeId) => ({ nodeId, online: true }));
+    ws.send(JSON.stringify({ type: "relay.connected", userId: uid, nodes, deviceOnline: nodes.length > 0 }));
+    console.log(`[Relay] Web connected: user=${uid} nodes=${nodes.length}`);
+  };
   authenticateRelay(apiKey).then((uid) => {
-    if (uid) {
-      userId = uid;
-      authenticated = true;
-      addToMap(webSockets, userId, ws);
-      const deviceOnline = deviceSockets.has(userId) && deviceSockets.get(userId).size > 0;
-      ws.send(JSON.stringify({ type: "relay.connected", userId, deviceOnline }));
-      console.log(`[Relay] Web connected: user=${userId} deviceOnline=${deviceOnline}`);
-    } else {
-      ws.send(JSON.stringify({ type: "relay.error", message: 'Authentication required. Send: {"type":"auth","key":"oc_..."}' }));
-    }
+    if (uid) finishAuth(uid);
+    else ws.send(JSON.stringify({ type: "relay.error", message: 'Authentication required. Send: {"type":"auth","key":"oc_..."}' }));
   });
   ws.on("message", (raw) => {
     let msg;
@@ -48114,30 +48176,26 @@ wssWeb.on("connection", (ws, req) => {
     }
     if (!authenticated && msg.type === "auth") {
       authenticateRelay(msg.key).then((uid) => {
-        if (uid) {
-          userId = uid;
-          authenticated = true;
-          addToMap(webSockets, userId, ws);
-          const deviceOnline = deviceSockets.has(userId) && deviceSockets.get(userId).size > 0;
-          ws.send(JSON.stringify({ type: "relay.connected", userId, deviceOnline }));
-          console.log(`[Relay] Web authenticated: user=${userId}`);
-        } else {
-          ws.send(JSON.stringify({ type: "relay.error", message: "Invalid API key" }));
-        }
+        if (!uid) return ws.send(JSON.stringify({ type: "relay.error", message: "Invalid API key" }));
+        finishAuth(uid);
       });
       return;
     }
     if (!authenticated || !userId) return;
-    console.log(`[Relay] Web msg: user=${userId} type=${msg.type}`);
     if (msg.type?.startsWith("relay.")) {
-      const devCount = deviceSockets.get(userId)?.size || 0;
-      console.log(`[Relay] Forwarding ${msg.type} to ${devCount} device clients`);
-      sendToAll(deviceSockets, userId, msg);
+      if (msg.targetNodeId) {
+        const delivered = sendToDeviceNode(userId, msg.targetNodeId, msg);
+        if (!delivered) {
+          ws.send(JSON.stringify({ type: "relay.error", message: `Target node offline: ${msg.targetNodeId}` }));
+        }
+      } else {
+        sendToAllDeviceNodes(userId, msg);
+      }
     }
   });
   ws.on("close", () => {
     if (userId) {
-      removeFromMap(webSockets, userId, ws);
+      removeWebSocket(userId, ws);
       console.log(`[Relay] Web disconnected: user=${userId}`);
     }
   });
@@ -48154,11 +48212,12 @@ server.on("upgrade", (req, socket, head2) => {
     socket.destroy();
   }
 });
-app.get("/api/relay/status", (req, res) => {
+app.get("/api/relay/status", (_req, res) => {
   res.json({
     ok: true,
-    devices: deviceSockets.size,
-    webClients: webSockets.size
+    deviceUsers: deviceSockets.size,
+    webUsers: webSockets.size,
+    totalNodes: Array.from(deviceSockets.values()).reduce((sum, m) => sum + m.size, 0)
   });
 });
 var PORT = parseInt(process.env.PORT || "3001", 10);

@@ -581,6 +581,7 @@ export default function CloudPage() {
   const [flow, setFlow] = useState<FlowState>('loading')
   const [selectedTemplateId, setSelectedTemplateId] = useState<AgentTemplateId>((localStorage.getItem('overclaw-cloud-template') as AgentTemplateId) || DEFAULT_TEMPLATE_ID)
   const [rightTab, setRightTab] = useState<'tasks' | 'subagents'>('tasks')
+  const [nodeId, setNodeId] = useState<string>(localStorage.getItem('overclaw-node-id') || 'node-1')
 
   // Check subscription
   useEffect(() => {
@@ -609,6 +610,10 @@ export default function CloudPage() {
   useEffect(() => {
     localStorage.setItem('overclaw-cloud-template', selectedTemplateId)
   }, [selectedTemplateId])
+
+  useEffect(() => {
+    localStorage.setItem('overclaw-node-id', nodeId)
+  }, [nodeId])
 
   // Activate screensaver after 30s of relay connection with no local interaction
   useEffect(() => {
@@ -732,7 +737,7 @@ export default function CloudPage() {
               console.log(`[Relay] Resumed project: ${projectName}`)
             } catch (e) { console.error('[Relay] Resume failed:', e) }
           },
-        })
+        }, nodeId)
         client.connect()
         setRelayClient(client)
       } catch (e) {
@@ -743,7 +748,7 @@ export default function CloudPage() {
       cancelled = true
       setRelayClient(prev => { prev?.destroy(); return null })
     }
-  }, [flow, user, session])
+  }, [flow, user, session, nodeId])
 
   const initialCheckDone = useRef(false)
   useEffect(() => {
@@ -1322,6 +1327,25 @@ ${teamSection}`
           onCancel={() => setShowConfirmReset(false)}
         />
       )}
+      <div className="px-3 pt-3">
+        <div className="rounded-lg p-2 flex items-center gap-2 flex-wrap" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
+          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>Active Node</span>
+          {Array.from({ length: 10 }, (_, i) => `node-${i + 1}`).map(id => (
+            <button
+              key={id}
+              onClick={() => setNodeId(id)}
+              className="px-2.5 py-1 text-xs rounded-full transition-all"
+              style={{
+                background: nodeId === id ? 'var(--accent-blue)' : 'transparent',
+                color: nodeId === id ? '#fff' : 'var(--text-muted)',
+                border: `1px solid ${nodeId === id ? 'var(--accent-blue)' : 'var(--border-color)'}`,
+              }}
+            >
+              Node {id.split('-')[1]}
+            </button>
+          ))}
+        </div>
+      </div>
       <div className="flex flex-1 gap-3 p-3 min-h-0">
         <div className="flex flex-col w-[58%] min-w-0">
           <GatewayChat

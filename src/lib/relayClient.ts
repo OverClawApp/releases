@@ -45,22 +45,25 @@ export class RelayClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
   private destroyed = false;
+  private nodeId: string;
 
-  constructor(apiKey: string, callbacks: RelayCallbacks) {
+  constructor(apiKey: string, callbacks: RelayCallbacks, nodeId: string = 'node-1') {
     this.apiKey = apiKey;
     this.callbacks = callbacks;
+    this.nodeId = nodeId || 'node-1';
   }
 
   connect() {
     if (this.destroyed) return;
     if (this.ws) { this.ws.close(); this.ws = null; }
 
-    const url = `${RELAY_URL}?key=${encodeURIComponent(this.apiKey)}`;
+    const url = `${RELAY_URL}?key=${encodeURIComponent(this.apiKey)}&nodeId=${encodeURIComponent(this.nodeId)}`;
     console.log('[Relay] Connecting to relay server...');
     this.ws = new WebSocket(url);
 
     this.ws.addEventListener('open', () => {
       console.log('[Relay] WebSocket open');
+      this.ws?.send(JSON.stringify({ type: 'auth', key: this.apiKey, nodeId: this.nodeId }));
     });
 
     this.ws.addEventListener('message', (ev) => {
@@ -179,8 +182,9 @@ export class RelayClient {
 
   private send(msg: any) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      console.log('[RelayClient] Sending:', msg.type)
-      this.ws.send(JSON.stringify(msg));
+      const outbound = { ...msg, sourceNodeId: msg?.sourceNodeId || this.nodeId };
+      console.log('[RelayClient] Sending:', outbound.type)
+      this.ws.send(JSON.stringify(outbound));
     } else {
       console.warn('[RelayClient] Cannot send, ws state:', this.ws?.readyState)
     }
