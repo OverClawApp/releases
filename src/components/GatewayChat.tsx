@@ -159,23 +159,6 @@ function extractText(content: any): string | null {
   return null
 }
 
-function mergeStreamText(prev: string, incoming: string): string {
-  if (!incoming) return prev
-  if (!prev) return incoming
-  if (incoming.startsWith(prev)) return incoming
-  if (prev.startsWith(incoming)) return prev
-  return prev + incoming
-}
-
-function estimateInternalTokenCost(message: string) {
-  const approxInputTokens = Math.max(1, Math.ceil(message.length / 4))
-  const complexity = classifyComplexity(message || 'task')
-  const outputMultiplier = complexity === 'smart' ? 3.5 : complexity === 'balanced' ? 2.2 : 1.4
-  const approxOutputTokens = Math.max(16, Math.ceil(approxInputTokens * outputMultiplier))
-  const estimatedInternalTokens = Math.ceil((approxInputTokens * 0.015) + (approxOutputTokens * 0.06))
-  return { complexity, approxInputTokens, approxOutputTokens, estimatedInternalTokens }
-}
-
 function cleanDisplayText(text: string): string {
   // Strip [[reply_to_current]], [[reply_to:<id>]], [[ reply_to_current ]] etc.
   text = text.replace(/\[\[\s*reply_to[^\]]*\]\]/g, '')
@@ -357,11 +340,6 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
   const [thinkingQuote, setThinkingQuote] = useState('')
   const [attachments, setAttachments] = useState<ChatAttachment[]>([])
   const [dragOver, setDragOver] = useState(false)
-  const [pendingConfirm, setPendingConfirm] = useState<null | {
-    text: string
-    attachments: ChatAttachment[]
-    estimate: ReturnType<typeof estimateInternalTokenCost>
-  }>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const MAX_ATTACHMENTS = 5
@@ -628,12 +606,6 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
                 relayRef.current?.sendStatus('idle')
               })
             }
-          } else if (p.stream && p.stream !== 'lifecycle') {
-            const detail = p.data?.text || p.data?.message || p.data?.status || p.data?.name
-            if (detail) {
-              setStreaming(true)
-              setStreamText(prev => mergeStreamText(prev, `${prev ? '\n' : ''}[${p.stream}] ${String(detail)}`))
-            }
           }
         }
         if (msg.event === 'chat') {
@@ -642,7 +614,7 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
           if (p.state === 'delta') {
             const text = extractText(p.message)
             if (text !== null) {
-              setStreamText(prev => mergeStreamText(prev, text)); setStreaming(true)
+              setStreamText(text); setStreaming(true)
               relayRef.current?.sendDelta(text)
             }
           } else if (p.state === 'final') {
@@ -684,9 +656,15 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
 
   const [activeModel, setActiveModel] = useState<string | null>(null)
 
-  const executeSend = useCallback(async (rawText: string, currentAttachments: ChatAttachment[]) => {
-    const text = rawText.trim()
-    const hasAttachments = currentAttachments.length > 0
+  const send = useCallback(async () => {
+    const text = input.trim()
+    const hasAttachments = attachments.length > 0
+    if ((!text && !hasAttachments) || streaming) return
+    const lower = text.toLowerCase()
+    if (lower === '/stop' || lower === 'stop' || lower === 'abort') {
+      try { await wsRequest('chat.abort', { sessionKey }) } catch {}
+      setInput(''); return
+    }
 
     // Auto-route to the right model based on complexity
     try {
@@ -705,14 +683,17 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
       console.warn('[GatewayChat] Model routing failed, using default:', e)
     }
 
+    // Build attachment display info for the local message
+    const currentAttachments = [...attachments]
     const displayAttachments = currentAttachments.map(a => ({ mimeType: a.mimeType, fileName: a.fileName, dataUrl: a.dataUrl }))
+
     const userContent = text || (hasAttachments ? `📎 ${currentAttachments.map(a => a.fileName).join(', ')}` : '')
     const userAttachments = displayAttachments.length > 0 ? displayAttachments : undefined
+    // Store attachments persistently for history refresh matching
     if (userAttachments?.length && userContent) {
       attachmentStoreRef.current.set(userContent.slice(0, 80), userAttachments)
       saveAttachmentStore()
     }
-
     setMessages(prev => [...prev, { role: 'user', content: userContent, attachments: userAttachments, timestamp: Date.now() }])
     setInput(''); setAttachments([]); setStreaming(true); setStreamText('')
     setThinkingQuote(THINKING_QUOTES[Math.floor(Math.random() * THINKING_QUOTES.length)])
@@ -720,6 +701,8 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
     runIdRef.current = idempotencyKey
     const fullMessage = messagePrefix ? `${messagePrefix}\n\n${text}` : text
 
+    // Save all attachments to workspace uploads dir
+    // Images: agent uses `image` tool to analyze | Files: agent uses `read` tool
     let messageWithFiles = fullMessage
     const savedImages: string[] = []
     const savedDocs: string[] = []
@@ -730,8 +713,12 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
         const safeName = a.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')
         const filePath = `${stateDir}/workspace/uploads/${safeName}`
         await window.electronAPI!.writeFile(filePath, base64)
-        if (a.mimeType.startsWith('image/')) savedImages.push(filePath)
-        else savedDocs.push(filePath)
+        if (a.mimeType.startsWith('image/')) {
+          savedImages.push(filePath)
+        } else {
+          savedDocs.push(filePath)
+        }
+        console.log(`[GatewayChat] Saved file: ${filePath}`)
       } catch (e) {
         console.error(`[GatewayChat] Failed to save file ${a.fileName}:`, e)
       }
@@ -744,35 +731,21 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
       const fileList = savedDocs.map(f => `- ${f}`).join('\n')
       const hasPdf = savedDocs.some(f => f.toLowerCase().endsWith('.pdf'))
       messageWithFiles += `\n\nThe user has uploaded files:\n${fileList}`
-      messageWithFiles += hasPdf
-        ? `\nFor PDF files: use \`exec\` to convert to text first (e.g. \`pdftotext file.pdf file.txt\` — install with \`brew install poppler\` if needed), then \`read\` the .txt output.`
-        : `\nUse \`read\` to access them.`
+      if (hasPdf) {
+        messageWithFiles += `\nFor PDF files: use \`exec\` to convert to text first (e.g. \`pdftotext file.pdf file.txt\` — install with \`brew install poppler\` if needed), then \`read\` the .txt output.`
+      } else {
+        messageWithFiles += `\nUse \`read\` to access them.`
+      }
     }
 
     try {
-      await wsRequest('chat.send', { sessionKey, message: messageWithFiles, deliver: false, idempotencyKey })
+      const params: any = { sessionKey, message: messageWithFiles, deliver: false, idempotencyKey }
+      await wsRequest('chat.send', params)
     } catch (err: any) {
       setStreaming(false); setStreamText(''); runIdRef.current = null
       setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${err.message}`, timestamp: Date.now() }])
     }
-  }, [wsRequest, sessionKey, messagePrefix, stateDir, activeModel, saveAttachmentStore])
-
-  const send = useCallback(async () => {
-    const text = input.trim()
-    const currentAttachments = [...attachments]
-    const hasAttachments = currentAttachments.length > 0
-    if ((!text && !hasAttachments) || streaming) return
-
-    const lower = text.toLowerCase()
-    if (lower === '/stop' || lower === 'stop' || lower === 'abort') {
-      try { await wsRequest('chat.abort', { sessionKey }) } catch {}
-      setInput('')
-      return
-    }
-
-    const estimate = estimateInternalTokenCost(text || currentAttachments.map(a => a.fileName).join(' '))
-    setPendingConfirm({ text, attachments: currentAttachments, estimate })
-  }, [input, attachments, streaming, wsRequest, sessionKey])
+  }, [input, attachments, streaming, wsRequest, sessionKey, activeModel])
 
   const abort = useCallback(async () => {
     try { await wsRequest('chat.abort', { sessionKey }) } catch {}
@@ -879,40 +852,6 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
         </div>
       )}
 
-      {pendingConfirm && (
-        <div className="absolute inset-0 z-[60] flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.55)' }}>
-          <div className="w-[420px] rounded-xl p-4" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)' }}>
-            <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>Estimated internal token cost</h3>
-            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-              Preflight estimate generated with a lightweight model before task execution.
-            </p>
-            <div className="mt-3 text-xs space-y-1" style={{ color: 'var(--text-secondary)' }}>
-              <div>Task tier: <strong>{pendingConfirm.estimate.complexity}</strong></div>
-              <div>Estimated input/output: <strong>{pendingConfirm.estimate.approxInputTokens}</strong> / <strong>{pendingConfirm.estimate.approxOutputTokens}</strong> tokens</div>
-              <div>Estimated internal tokens charged: <strong>{pendingConfirm.estimate.estimatedInternalTokens}</strong></div>
-            </div>
-            <p className="text-[11px] mt-3" style={{ color: 'var(--text-muted)' }}>
-              If you continue, OverClaw will route to the best model, execute the task, and stream thoughts/process in the live box while keeping only the final answer in chat.
-            </p>
-            <div className="flex justify-end gap-2 mt-4">
-              <button className="px-3 py-1.5 rounded-lg text-xs" style={{ background: 'var(--bg-page)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)' }} onClick={() => setPendingConfirm(null)}>
-                Don&apos;t proceed
-              </button>
-              <button
-                className="px-3 py-1.5 rounded-lg text-xs"
-                style={{ background: 'var(--accent-blue)', color: '#fff' }}
-                onClick={async () => {
-                  const pending = pendingConfirm
-                  setPendingConfirm(null)
-                  if (pending) await executeSend(pending.text, pending.attachments)
-                }}
-              >
-                Continue
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
       <div className="px-4 py-3 flex items-center gap-2 shrink-0" style={{ borderBottom: '1px solid var(--border-color)' }}>
         <Bot size={16} style={{ color: 'var(--accent-teal)' }} />
         <span className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>{title || 'Chat with local agent'}</span>
