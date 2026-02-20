@@ -23,12 +23,16 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-app.use(cors());
+app.use(cors({
+  origin: ['https://overclaw.app', 'http://localhost:3000', 'http://localhost:3002', 'http://localhost:5173'],
+  credentials: true,
+}));
 // Stripe webhook needs raw body — must be before express.json()
 app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // Health check
+app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Serve install-agent.sh
@@ -44,6 +48,64 @@ app.get('/install-agent.sh', (_req, res) => {
   } else {
     res.status(404).send('install script not found');
   }
+});
+
+declare global {
+  namespace Express {
+    interface Request {
+      userId?: string;
+    }
+  }
+}
+
+async function getUserIdFromToken(token: string): Promise<string | null> {
+  if (!token || !supabaseAdmin) return null;
+
+  if (token.startsWith('oc_')) {
+    const { data } = await supabaseAdmin
+      .from('user_api_keys')
+      .select('user_id')
+      .eq('api_key', token)
+      .single();
+    return data?.user_id || null;
+  }
+
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data?.user?.id) return null;
+  return data.user.id;
+}
+
+async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    const auth = String(req.headers.authorization || '');
+    const bearerToken = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+    const sessionToken = String(req.headers['x-session-token'] || req.headers['x-openclaw-session-token'] || '').trim();
+    const token = bearerToken || sessionToken;
+
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+    const userId = await getUserIdFromToken(token);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    req.userId = userId;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+app.use((req, res, next) => {
+  const isPublic =
+    (req.method === 'GET' && (req.path === '/health' || req.path === '/api/health')) ||
+    (req.method === 'POST' && req.path === '/api/v1/chat/completions') ||
+    (req.method === 'GET' && req.path === '/api/relay/nodes') ||
+    req.path === '/install-agent.sh' ||
+    req.path.startsWith('/ws') ||
+    req.path.startsWith('/public/') ||
+    req.path === '/api/stripe/webhook';
+
+  if (isPublic) return next();
+  return requireAuth(req, res, next);
 });
 
 // Track WebSocket clients
@@ -62,7 +124,7 @@ function broadcast(msg: { type: string; data: string; command: string }) {
 
 function runCommand(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { shell: true, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
+    const proc = spawn(cmd, args, { shell: false, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
     let out = '';
     proc.stdout.on('data', (d) => { out += d.toString(); });
     proc.stderr.on('data', (d) => { out += d.toString(); });
@@ -72,7 +134,7 @@ function runCommand(cmd: string, args: string[]): Promise<string> {
 }
 
 function streamCommand(command: string, cmd: string, args: string[], res: express.Response) {
-  const proc = spawn(cmd, args, { shell: true, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
+  const proc = spawn(cmd, args, { shell: false, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
   
   broadcast({ type: 'output', data: `$ ${cmd} ${args.join(' ')}\n`, command });
   
@@ -641,7 +703,7 @@ app.get('/api/system-info', (_req, res) => {
   });
 });
 
-// GET /api/providers/keys — Get local API keys for syncing to cloud
+// GET /api/providers/keys — Get masked local API keys for syncing to cloud
 app.get('/api/providers/keys', async (_req, res) => {
   try {
     const envMap: Record<string, string> = {
@@ -655,12 +717,18 @@ app.get('/api/providers/keys', async (_req, res) => {
       GOOGLE_API_KEY: 'google',
     };
 
+    const maskKey = (value: string) => {
+      if (!value || value === '__configured_no_key__') return value;
+      if (value.length <= 9) return `${value.slice(0, 3)}...`;
+      return `${value.slice(0, 6)}...${value.slice(-3)}`;
+    };
+
     const keys: Record<string, string> = {};
 
     // 1. Check process environment variables (OpenClaw injects these at runtime)
     for (const [envVar, provider] of Object.entries(envMap)) {
       if (process.env[envVar]) {
-        keys[provider] = process.env[envVar]!;
+        keys[provider] = maskKey(process.env[envVar]!);
       }
     }
 
@@ -671,7 +739,7 @@ app.get('/api/providers/keys', async (_req, res) => {
       for (const line of envContent.split('\n')) {
         const match = line.match(/^([A-Z_]+)=(.+)$/);
         if (match && envMap[match[1]] && !keys[envMap[match[1]]]) {
-          keys[envMap[match[1]]] = match[2].trim();
+          keys[envMap[match[1]]] = maskKey(match[2].trim());
         }
       }
     }
@@ -1116,6 +1184,7 @@ app.post('/api/projects/plan', handleProjectPlan);
 import Stripe from 'stripe';
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null as any;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://overclaw.app';
 
 const STRIPE_PRICES: Record<string, Record<string, string>> = {
   pro: { monthly: 'price_1T1tTLEFXOKXciuuso4PEOQ8' },
@@ -1124,8 +1193,9 @@ const STRIPE_PRICES: Record<string, Record<string, string>> = {
 // POST /api/stripe/checkout — Create a Stripe Checkout session
 app.post('/api/stripe/checkout', async (req, res) => {
   try {
-    const { plan, interval, userId, email, scaleNodes } = req.body;
-    if (!plan || !interval || !userId) return res.status(400).json({ error: 'plan, interval, userId required' });
+    const { plan, interval, email, scaleNodes } = req.body;
+    const userId = req.userId;
+    if (!plan || !interval || !userId) return res.status(400).json({ error: 'plan, interval required' });
 
     const priceId = STRIPE_PRICES[plan]?.[interval];
     if (!priceId) return res.status(400).json({ error: 'Invalid plan or interval' });
@@ -1150,8 +1220,8 @@ app.post('/api/stripe/checkout', async (req, res) => {
       client_reference_id: userId,
       allow_promotion_codes: true,
       metadata: { plan, interval, userId, scaleNodes: String(scaleNodes || 0) },
-      success_url: `${req.headers.origin || 'http://localhost:5173'}/?billing=success&plan=${plan}`,
-      cancel_url: `${req.headers.origin || 'http://localhost:5173'}/?billing=cancelled`,
+      success_url: `${FRONTEND_URL}/?billing=success&plan=${plan}`,
+      cancel_url: `${FRONTEND_URL}/?billing=cancelled`,
     });
 
     res.json({ url: session.url });
@@ -1164,8 +1234,9 @@ app.post('/api/stripe/checkout', async (req, res) => {
 // POST /api/stripe/checkout-tokens — One-time token pack purchase
 app.post('/api/stripe/checkout-tokens', async (req, res) => {
   try {
-    const { tokens, price, userId, email } = req.body;
-    if (!tokens || !price || !userId) return res.status(400).json({ error: 'tokens, price, userId required' });
+    const { tokens, price, email } = req.body;
+    const userId = req.userId;
+    if (!tokens || !price || !userId) return res.status(400).json({ error: 'tokens, price required' });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -1185,8 +1256,8 @@ app.post('/api/stripe/checkout-tokens', async (req, res) => {
       client_reference_id: userId,
       allow_promotion_codes: true,
       metadata: { type: 'token_purchase', tokens: String(tokens), userId },
-      success_url: `${req.headers.origin || 'http://localhost:5173'}/?billing=tokens-success&tokens=${tokens}`,
-      cancel_url: `${req.headers.origin || 'http://localhost:5173'}/?billing=cancelled`,
+      success_url: `${FRONTEND_URL}/?billing=tokens-success&tokens=${tokens}`,
+      cancel_url: `${FRONTEND_URL}/?billing=cancelled`,
     });
 
     res.json({ url: session.url });
@@ -1199,7 +1270,9 @@ app.post('/api/stripe/checkout-tokens', async (req, res) => {
 // POST /api/stripe/portal — Create a Stripe Customer Portal session
 app.post('/api/stripe/portal', async (req, res) => {
   try {
-    const { userId, customerId: directCustomerId } = req.body;
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const { customerId: directCustomerId } = req.body;
     let customerId = directCustomerId;
 
     // Look up customer ID from subscription if only userId provided
@@ -1234,7 +1307,7 @@ app.post('/api/stripe/portal', async (req, res) => {
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${req.headers.origin || 'http://localhost:5173'}/?billing=portal-return`,
+      return_url: `${FRONTEND_URL}/?billing=portal-return`,
     });
 
     res.json({ url: session.url });
@@ -1526,7 +1599,11 @@ wssDevice.on('connection', (ws, req) => {
     if (!authenticated || !userId) return;
 
     if (msg.type === 'relay.node_message') {
-      const fromNodeId = msg.fromNodeId || msg.sourceNodeId || nodeId;
+      const claimedFromNodeId = msg.fromNodeId || msg.sourceNodeId;
+      if (claimedFromNodeId && claimedFromNodeId !== nodeId) {
+        ws.send(JSON.stringify({ type: 'relay.error', message: 'fromNodeId mismatch' }));
+        return;
+      }
       const toNodeId = msg.toNodeId;
       if (!toNodeId) {
         ws.send(JSON.stringify({ type: 'relay.error', message: 'relay.node_message requires toNodeId' }));
@@ -1534,7 +1611,7 @@ wssDevice.on('connection', (ws, req) => {
       }
       const delivered = sendToDeviceNode(userId, toNodeId, {
         type: 'relay.node_message',
-        fromNodeId,
+        fromNodeId: nodeId,
         toNodeId,
         payload: msg.payload,
       });
@@ -1549,13 +1626,13 @@ wssDevice.on('connection', (ws, req) => {
         conn.gatewayPort = msg.gatewayPort ?? conn.gatewayPort;
         conn.securityTier = msg.tier ?? msg.securityTier ?? conn.securityTier;
       }
-      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || nodeId };
+      const outbound = { ...msg, sourceNodeId: nodeId };
       sendToAllWeb(userId, outbound);
       return;
     }
 
     if (msg.type?.startsWith('relay.')) {
-      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || nodeId };
+      const outbound = { ...msg, sourceNodeId: nodeId };
       sendToAllWeb(userId, outbound);
     }
   });
@@ -1607,7 +1684,7 @@ wssWeb.on('connection', (ws, req) => {
     if (!authenticated || !userId) return;
 
     if (msg.type?.startsWith('relay.')) {
-      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || 'web' };
+      const outbound = { ...msg, sourceNodeId: 'web' };
       // Node-targeted web->device route (backward-compatible broadcast)
       if (outbound.targetNodeId) {
         const delivered = sendToDeviceNode(userId, outbound.targetNodeId, outbound);

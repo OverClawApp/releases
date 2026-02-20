@@ -6,6 +6,7 @@
 
 import type { Request, Response } from 'express'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import net from 'net'
 
 // ─── Model Definitions ─────────────────────────────────────────────────────
 
@@ -265,7 +266,7 @@ function getNextApiKey(model: ModelDef): string | null {
 function markKeyCooldown(model: ModelDef, key: string, retryAfterMs: number = 60000) {
   const pool = getKeyPool(model.envKey)
   pool.cooldowns.set(key, Date.now() + retryAfterMs)
-  console.log(`[Proxy] Key cooldown: ${model.envKey} (${key.slice(0, 8)}...) for ${retryAfterMs}ms`)
+  console.log(`[Proxy] Key cooldown: provider=${model.provider} model=${model.id} retryAfterMs=${retryAfterMs}`)
 }
 
 const MAX_RETRIES = 2
@@ -787,24 +788,16 @@ function extractInlineMedia(messages: any[]): any[] {
 export async function handleProxy(req: Request, res: Response) {
   const { messages: rawMessages, stream = true, model: requestedModel, tools, max_completion_tokens, stream_options } = req.body
   const extraParams = { tools, max_completion_tokens, stream_options }
-  console.log(`[Proxy] Request body keys: ${Object.keys(req.body).join(', ')}`)
+  console.log(`[Proxy] Request received: bodyKeys=${Object.keys(req.body).join(', ')}`)
   if (!rawMessages || !Array.isArray(rawMessages)) {
     return res.status(400).json({ error: { message: 'messages array required' } })
   }
   // Extract inline [IMAGE:...] and [FILE:...] markers into proper content parts
   const messages = extractInlineMedia(rawMessages)
 
-  // Debug: log message content types
-  console.log(`[Proxy] ${messages.length} messages total`)
-  for (const m of messages) {
-    if (Array.isArray(m.content)) {
-      const types = m.content.map((p: any) => `${p.type}${p.type === 'image_url' ? '('+((p.image_url?.url||'').substring(0,30))+'...)' : p.type === 'text' ? '("'+String(p.text||'').substring(0,80)+'")' : ''}`).join(', ')
-      console.log(`[Proxy] Message role=${m.role} content: [${types}]`)
-    } else {
-      const preview = String(m.content || '').substring(0, 200)
-      console.log(`[Proxy] Message role=${m.role} content type: ${typeof m.content}, len=${String(m.content || '').length}, preview: ${preview}`)
-    }
-  }
+  // Sanitized debug logging only (no prompts/content)
+  const imageCount = messages.reduce((count, m) => count + (Array.isArray(m.content) ? m.content.filter((p: any) => p.type === 'image_url' || p.type === 'image').length : 0), 0)
+  console.log(`[Proxy] messageCount=${messages.length} imageParts=${imageCount}`)
 
   // Auth
   const authResult = await verifyAuthAndGetUserId(req.headers.authorization)
@@ -1028,6 +1021,49 @@ export async function handleWebSearch(req: Request, res: Response) {
   }
 }
 
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split('.').map(n => parseInt(n, 10))
+  if (parts.length !== 4 || parts.some(Number.isNaN)) return true
+  if (parts[0] === 10) return true
+  if (parts[0] === 127) return true
+  if (parts[0] === 169 && parts[1] === 254) return true
+  if (parts[0] === 192 && parts[1] === 168) return true
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
+  return false
+}
+
+function isPrivateIpv6(ip: string): boolean {
+  const normalized = ip.toLowerCase()
+  return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd')
+}
+
+const BLOCKED_HOSTS = new Set([
+  'localhost',
+  'metadata.google.internal',
+  'metadata.google.internal.',
+  '169.254.169.254',
+  '100.100.100.200',
+])
+
+export function isUrlSafe(url: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) return false
+  const hostname = parsed.hostname.toLowerCase()
+  if (BLOCKED_HOSTS.has(hostname)) return false
+
+  const ipType = net.isIP(hostname)
+  if (ipType === 4 && isPrivateIpv4(hostname)) return false
+  if (ipType === 6 && isPrivateIpv6(hostname)) return false
+
+  return true
+}
+
 export async function handleWebFetch(req: Request, res: Response) {
   const { url, maxChars = 50000 } = req.body
   if (!url) return res.status(400).json({ error: { message: 'url is required' } })
@@ -1037,6 +1073,9 @@ export async function handleWebFetch(req: Request, res: Response) {
   if ('error' in authResult) return res.status(401).json({ error: { message: authResult.error } })
 
   try {
+    const safe = isUrlSafe(url)
+    if (!safe) return res.status(400).json({ error: { message: 'Unsafe URL blocked' } })
+
     const fetchRes = await fetch(url, {
       headers: { 'User-Agent': 'OverClaw/1.0 (compatible; bot)' },
       redirect: 'follow',

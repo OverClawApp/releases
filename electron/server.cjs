@@ -26583,7 +26583,7 @@ var require_websocket = __commonJS({
     var EventEmitter2 = require("events");
     var https2 = require("https");
     var http2 = require("http");
-    var net = require("net");
+    var net2 = require("net");
     var tls = require("tls");
     var { randomBytes, createHash: createHash2 } = require("crypto");
     var { Duplex, Readable } = require("stream");
@@ -27317,12 +27317,12 @@ var require_websocket = __commonJS({
     }
     function netConnect(options) {
       options.path = options.socketPath;
-      return net.connect(options);
+      return net2.connect(options);
     }
     function tlsConnect(options) {
       options.path = void 0;
       if (!options.servername && options.servername !== "") {
-        options.servername = net.isIP(options.host) ? "" : options.host;
+        options.servername = net2.isIP(options.host) ? "" : options.host;
       }
       return tls.connect(options);
     }
@@ -40558,6 +40558,7 @@ function shouldShowDeprecationWarning() {
 if (shouldShowDeprecationWarning()) console.warn("\u26A0\uFE0F  Node.js 18 and below are deprecated and will no longer be supported in future versions of @supabase/supabase-js. Please upgrade to Node.js 20 or later. For more information, visit: https://github.com/orgs/supabase/discussions/37217");
 
 // src/server/proxy.ts
+var import_net = __toESM(require("net"), 1);
 var MODELS = {
   "claude-sonnet-4": {
     id: "claude-sonnet-4",
@@ -40761,7 +40762,7 @@ function getNextApiKey(model) {
 function markKeyCooldown(model, key, retryAfterMs = 6e4) {
   const pool = getKeyPool(model.envKey);
   pool.cooldowns.set(key, Date.now() + retryAfterMs);
-  console.log(`[Proxy] Key cooldown: ${model.envKey} (${key.slice(0, 8)}...) for ${retryAfterMs}ms`);
+  console.log(`[Proxy] Key cooldown: provider=${model.provider} model=${model.id} retryAfterMs=${retryAfterMs}`);
 }
 var MAX_RETRIES = 2;
 var RETRY_DELAY_MS = 1e3;
@@ -41177,21 +41178,13 @@ ${text}
 async function handleProxy(req, res) {
   const { messages: rawMessages, stream = true, model: requestedModel, tools, max_completion_tokens, stream_options } = req.body;
   const extraParams = { tools, max_completion_tokens, stream_options };
-  console.log(`[Proxy] Request body keys: ${Object.keys(req.body).join(", ")}`);
+  console.log(`[Proxy] Request received: bodyKeys=${Object.keys(req.body).join(", ")}`);
   if (!rawMessages || !Array.isArray(rawMessages)) {
     return res.status(400).json({ error: { message: "messages array required" } });
   }
   const messages = extractInlineMedia(rawMessages);
-  console.log(`[Proxy] ${messages.length} messages total`);
-  for (const m of messages) {
-    if (Array.isArray(m.content)) {
-      const types = m.content.map((p) => `${p.type}${p.type === "image_url" ? "(" + (p.image_url?.url || "").substring(0, 30) + "...)" : p.type === "text" ? '("' + String(p.text || "").substring(0, 80) + '")' : ""}`).join(", ");
-      console.log(`[Proxy] Message role=${m.role} content: [${types}]`);
-    } else {
-      const preview = String(m.content || "").substring(0, 200);
-      console.log(`[Proxy] Message role=${m.role} content type: ${typeof m.content}, len=${String(m.content || "").length}, preview: ${preview}`);
-    }
-  }
+  const imageCount = messages.reduce((count, m) => count + (Array.isArray(m.content) ? m.content.filter((p) => p.type === "image_url" || p.type === "image").length : 0), 0);
+  console.log(`[Proxy] messageCount=${messages.length} imageParts=${imageCount}`);
   const authResult = await verifyAuthAndGetUserId(req.headers.authorization);
   if ("error" in authResult) {
     return res.status(401).json({ error: { message: authResult.error } });
@@ -41388,12 +41381,50 @@ async function handleWebSearch(req, res) {
     res.status(500).json({ error: { message: err.message } });
   }
 }
+function isPrivateIpv4(ip) {
+  const parts = ip.split(".").map((n) => parseInt(n, 10));
+  if (parts.length !== 4 || parts.some(Number.isNaN)) return true;
+  if (parts[0] === 10) return true;
+  if (parts[0] === 127) return true;
+  if (parts[0] === 169 && parts[1] === 254) return true;
+  if (parts[0] === 192 && parts[1] === 168) return true;
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+  return false;
+}
+function isPrivateIpv6(ip) {
+  const normalized = ip.toLowerCase();
+  return normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd");
+}
+var BLOCKED_HOSTS = /* @__PURE__ */ new Set([
+  "localhost",
+  "metadata.google.internal",
+  "metadata.google.internal.",
+  "169.254.169.254",
+  "100.100.100.200"
+]);
+function isUrlSafe(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) return false;
+  const hostname = parsed.hostname.toLowerCase();
+  if (BLOCKED_HOSTS.has(hostname)) return false;
+  const ipType = import_net.default.isIP(hostname);
+  if (ipType === 4 && isPrivateIpv4(hostname)) return false;
+  if (ipType === 6 && isPrivateIpv6(hostname)) return false;
+  return true;
+}
 async function handleWebFetch(req, res) {
   const { url, maxChars = 5e4 } = req.body;
   if (!url) return res.status(400).json({ error: { message: "url is required" } });
   const authResult = await verifyAuthAndGetUserId(req.headers.authorization);
   if ("error" in authResult) return res.status(401).json({ error: { message: authResult.error } });
   try {
+    const safe = isUrlSafe(url);
+    if (!safe) return res.status(400).json({ error: { message: "Unsafe URL blocked" } });
     const fetchRes = await fetch(url, {
       headers: { "User-Agent": "OverClaw/1.0 (compatible; bot)" },
       redirect: "follow"
@@ -46905,9 +46936,13 @@ var supabaseAdmin = supabaseKey ? createClient(
 var app = (0, import_express.default)();
 var server = (0, import_http.createServer)(app);
 var wss = new import_websocket_server.default({ noServer: true });
-app.use((0, import_cors.default)());
+app.use((0, import_cors.default)({
+  origin: ["https://overclaw.app", "http://localhost:3000", "http://localhost:3002", "http://localhost:5173"],
+  credentials: true
+}));
 app.use("/api/stripe/webhook", import_express.default.raw({ type: "application/json" }));
 app.use(import_express.default.json());
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get("/install-agent.sh", (_req, res) => {
   const candidates = [
@@ -46920,6 +46955,36 @@ app.get("/install-agent.sh", (_req, res) => {
   } else {
     res.status(404).send("install script not found");
   }
+});
+async function getUserIdFromToken(token) {
+  if (!token || !supabaseAdmin) return null;
+  if (token.startsWith("oc_")) {
+    const { data: data2 } = await supabaseAdmin.from("user_api_keys").select("user_id").eq("api_key", token).single();
+    return data2?.user_id || null;
+  }
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data?.user?.id) return null;
+  return data.user.id;
+}
+async function requireAuth(req, res, next) {
+  try {
+    const auth = String(req.headers.authorization || "");
+    const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    const sessionToken = String(req.headers["x-session-token"] || req.headers["x-openclaw-session-token"] || "").trim();
+    const token = bearerToken || sessionToken;
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const userId = await getUserIdFromToken(token);
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+    req.userId = userId;
+    next();
+  } catch {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+}
+app.use((req, res, next) => {
+  const isPublic = req.method === "GET" && (req.path === "/health" || req.path === "/api/health") || req.method === "POST" && req.path === "/api/v1/chat/completions" || req.method === "GET" && req.path === "/api/relay/nodes" || req.path === "/install-agent.sh" || req.path.startsWith("/ws") || req.path.startsWith("/public/") || req.path === "/api/stripe/webhook";
+  if (isPublic) return next();
+  return requireAuth(req, res, next);
 });
 var clients = /* @__PURE__ */ new Set();
 wss.on("connection", (ws) => {
@@ -46934,7 +46999,7 @@ function broadcast(msg) {
 }
 function runCommand(cmd, args) {
   return new Promise((resolve, reject) => {
-    const proc = (0, import_child_process2.spawn)(cmd, args, { shell: true, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
+    const proc = (0, import_child_process2.spawn)(cmd, args, { shell: false, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
     let out = "";
     proc.stdout.on("data", (d) => {
       out += d.toString();
@@ -46947,7 +47012,7 @@ function runCommand(cmd, args) {
   });
 }
 function streamCommand(command, cmd, args, res) {
-  const proc = (0, import_child_process2.spawn)(cmd, args, { shell: true, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
+  const proc = (0, import_child_process2.spawn)(cmd, args, { shell: false, env: { ...process.env, PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH}` } });
   broadcast({ type: "output", data: `$ ${cmd} ${args.join(" ")}
 `, command });
   proc.stdout.on("data", (d) => broadcast({ type: "output", data: d.toString(), command }));
@@ -47424,10 +47489,15 @@ app.get("/api/providers/keys", async (_req, res) => {
       XAI_API_KEY: "xai",
       GOOGLE_API_KEY: "google"
     };
+    const maskKey = (value) => {
+      if (!value || value === "__configured_no_key__") return value;
+      if (value.length <= 9) return `${value.slice(0, 3)}...`;
+      return `${value.slice(0, 6)}...${value.slice(-3)}`;
+    };
     const keys = {};
     for (const [envVar, provider] of Object.entries(envMap)) {
       if (process.env[envVar]) {
-        keys[provider] = process.env[envVar];
+        keys[provider] = maskKey(process.env[envVar]);
       }
     }
     const envPath = import_path.default.join((0, import_os.homedir)(), ".openclaw", ".env");
@@ -47436,7 +47506,7 @@ app.get("/api/providers/keys", async (_req, res) => {
       for (const line of envContent.split("\n")) {
         const match = line.match(/^([A-Z_]+)=(.+)$/);
         if (match && envMap[match[1]] && !keys[envMap[match[1]]]) {
-          keys[envMap[match[1]]] = match[2].trim();
+          keys[envMap[match[1]]] = maskKey(match[2].trim());
         }
       }
     }
@@ -47792,13 +47862,15 @@ app.get("/api/proxy/models", handleGetModels);
 app.get("/api/proxy/apikey", handleGetApiKey);
 app.post("/api/projects/plan", handleProjectPlan);
 var stripe = process.env.STRIPE_SECRET_KEY ? new stripe_esm_node_default(process.env.STRIPE_SECRET_KEY) : null;
+var FRONTEND_URL = process.env.FRONTEND_URL || "https://overclaw.app";
 var STRIPE_PRICES = {
   pro: { monthly: "price_1T1tTLEFXOKXciuuso4PEOQ8" }
 };
 app.post("/api/stripe/checkout", async (req, res) => {
   try {
-    const { plan, interval, userId, email, scaleNodes } = req.body;
-    if (!plan || !interval || !userId) return res.status(400).json({ error: "plan, interval, userId required" });
+    const { plan, interval, email, scaleNodes } = req.body;
+    const userId = req.userId;
+    if (!plan || !interval || !userId) return res.status(400).json({ error: "plan, interval required" });
     const priceId = STRIPE_PRICES[plan]?.[interval];
     if (!priceId) return res.status(400).json({ error: "Invalid plan or interval" });
     const lineItems = [
@@ -47818,8 +47890,8 @@ app.post("/api/stripe/checkout", async (req, res) => {
       client_reference_id: userId,
       allow_promotion_codes: true,
       metadata: { plan, interval, userId, scaleNodes: String(scaleNodes || 0) },
-      success_url: `${req.headers.origin || "http://localhost:5173"}/?billing=success&plan=${plan}`,
-      cancel_url: `${req.headers.origin || "http://localhost:5173"}/?billing=cancelled`
+      success_url: `${FRONTEND_URL}/?billing=success&plan=${plan}`,
+      cancel_url: `${FRONTEND_URL}/?billing=cancelled`
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -47829,8 +47901,9 @@ app.post("/api/stripe/checkout", async (req, res) => {
 });
 app.post("/api/stripe/checkout-tokens", async (req, res) => {
   try {
-    const { tokens, price, userId, email } = req.body;
-    if (!tokens || !price || !userId) return res.status(400).json({ error: "tokens, price, userId required" });
+    const { tokens, price, email } = req.body;
+    const userId = req.userId;
+    if (!tokens || !price || !userId) return res.status(400).json({ error: "tokens, price required" });
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       payment_method_types: ["card"],
@@ -47849,8 +47922,8 @@ app.post("/api/stripe/checkout-tokens", async (req, res) => {
       client_reference_id: userId,
       allow_promotion_codes: true,
       metadata: { type: "token_purchase", tokens: String(tokens), userId },
-      success_url: `${req.headers.origin || "http://localhost:5173"}/?billing=tokens-success&tokens=${tokens}`,
-      cancel_url: `${req.headers.origin || "http://localhost:5173"}/?billing=cancelled`
+      success_url: `${FRONTEND_URL}/?billing=tokens-success&tokens=${tokens}`,
+      cancel_url: `${FRONTEND_URL}/?billing=cancelled`
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -47860,7 +47933,9 @@ app.post("/api/stripe/checkout-tokens", async (req, res) => {
 });
 app.post("/api/stripe/portal", async (req, res) => {
   try {
-    const { userId, customerId: directCustomerId } = req.body;
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+    const { customerId: directCustomerId } = req.body;
     let customerId = directCustomerId;
     if (!customerId && userId && supabaseAdmin) {
       const { data } = await supabaseAdmin.from("subscriptions").select("stripe_customer_id").eq("user_id", userId).single();
@@ -47884,7 +47959,7 @@ app.post("/api/stripe/portal", async (req, res) => {
     if (!customerId) return res.status(400).json({ error: "No Stripe customer found. Please subscribe first." });
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${req.headers.origin || "http://localhost:5173"}/?billing=portal-return`
+      return_url: `${FRONTEND_URL}/?billing=portal-return`
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -48131,7 +48206,11 @@ wssDevice.on("connection", (ws, req) => {
     }
     if (!authenticated || !userId) return;
     if (msg.type === "relay.node_message") {
-      const fromNodeId = msg.fromNodeId || msg.sourceNodeId || nodeId;
+      const claimedFromNodeId = msg.fromNodeId || msg.sourceNodeId;
+      if (claimedFromNodeId && claimedFromNodeId !== nodeId) {
+        ws.send(JSON.stringify({ type: "relay.error", message: "fromNodeId mismatch" }));
+        return;
+      }
       const toNodeId = msg.toNodeId;
       if (!toNodeId) {
         ws.send(JSON.stringify({ type: "relay.error", message: "relay.node_message requires toNodeId" }));
@@ -48139,7 +48218,7 @@ wssDevice.on("connection", (ws, req) => {
       }
       const delivered = sendToDeviceNode(userId, toNodeId, {
         type: "relay.node_message",
-        fromNodeId,
+        fromNodeId: nodeId,
         toNodeId,
         payload: msg.payload
       });
@@ -48153,12 +48232,12 @@ wssDevice.on("connection", (ws, req) => {
         conn.gatewayPort = msg.gatewayPort ?? conn.gatewayPort;
         conn.securityTier = msg.tier ?? msg.securityTier ?? conn.securityTier;
       }
-      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || nodeId };
+      const outbound = { ...msg, sourceNodeId: nodeId };
       sendToAllWeb(userId, outbound);
       return;
     }
     if (msg.type?.startsWith("relay.")) {
-      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || nodeId };
+      const outbound = { ...msg, sourceNodeId: nodeId };
       sendToAllWeb(userId, outbound);
     }
   });
@@ -48205,7 +48284,7 @@ wssWeb.on("connection", (ws, req) => {
     }
     if (!authenticated || !userId) return;
     if (msg.type?.startsWith("relay.")) {
-      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || "web" };
+      const outbound = { ...msg, sourceNodeId: "web" };
       if (outbound.targetNodeId) {
         const delivered = sendToDeviceNode(userId, outbound.targetNodeId, outbound);
         if (!delivered) {

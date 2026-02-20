@@ -48,16 +48,29 @@ export async function deriveSharedKey(privateKey: CryptoKey, peerPublicKey: Json
   );
 }
 
-export async function encrypt(key: CryptoKey, plaintext: string): Promise<{ iv: string; ct: string }> {
-  const iv = new Uint8Array(toArrayBuffer(crypto.getRandomValues(new Uint8Array(12))));
-  const pt = new TextEncoder().encode(plaintext);
-  const encrypted = await ensureSubtle().encrypt({ name: 'AES-GCM', iv }, key, toArrayBuffer(pt));
-  return { iv: toBase64(iv), ct: toBase64(new Uint8Array(encrypted)) };
+export async function hashKey(key: string): Promise<string> {
+  const encoded = new TextEncoder().encode(key);
+  const hash = await crypto.subtle.digest('SHA-256', encoded);
+  return btoa(String.fromCharCode(...new Uint8Array(hash)));
 }
 
-export async function decrypt(key: CryptoKey, encrypted: { iv: string; ct: string }): Promise<string> {
+export async function encrypt(key: CryptoKey, plaintext: string): Promise<{ iv: string; ct: string; ts: number }> {
+  const ts = Date.now();
+  const payload = JSON.stringify({ data: plaintext, ts });
+  const iv = new Uint8Array(toArrayBuffer(crypto.getRandomValues(new Uint8Array(12))));
+  const pt = new TextEncoder().encode(payload);
+  const encrypted = await ensureSubtle().encrypt({ name: 'AES-GCM', iv }, key, toArrayBuffer(pt));
+  return { iv: toBase64(iv), ct: toBase64(new Uint8Array(encrypted)), ts };
+}
+
+export async function decrypt(key: CryptoKey, encrypted: { iv: string; ct: string; ts?: number }): Promise<string> {
   const iv = new Uint8Array(toArrayBuffer(fromBase64(encrypted.iv)));
   const ct = fromBase64(encrypted.ct);
   const pt = await ensureSubtle().decrypt({ name: 'AES-GCM', iv }, key, toArrayBuffer(ct));
-  return new TextDecoder().decode(pt);
+  const decrypted = new TextDecoder().decode(pt);
+  const { data, ts } = JSON.parse(decrypted);
+  if (ts && Math.abs(Date.now() - ts) > 60000) {
+    throw new Error('Replay detected: message too old');
+  }
+  return data;
 }

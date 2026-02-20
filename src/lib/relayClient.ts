@@ -2,12 +2,13 @@
  * RelayClient — connects the desktop app to the Railway relay server.
  */
 
-import { decrypt, deriveSharedKey, encrypt, generateKeyPair } from './relayCrypto';
+import { decrypt, deriveSharedKey, encrypt, generateKeyPair, hashKey } from './relayCrypto';
 import { DEFAULT_RATE_LIMITS, type RateLimitConfig, type SecurityTier } from './securityTiers';
 
 const RELAY_URL = 'wss://overclaw-api-production.up.railway.app/ws/device';
-const PLAIN_FIELDS = new Set(['type', 'sourceNodeId', 'targetNodeId', 'id', 'rpcId', 'publicKey']);
+const PLAIN_FIELDS = new Set(['type', 'sourceNodeId', 'targetNodeId', 'id', 'rpcId', 'publicKey', 'keyHash']);
 const RATE_LIMITS_KEY = 'overclaw-node-ratelimits';
+const SENSITIVE_INBOUND_TYPES = new Set(['relay.send', 'relay.abort', 'relay.history_request', 'relay.rpc_request']);
 
 export interface ProjectTask {
   title: string;
@@ -33,6 +34,7 @@ export interface RelayCallbacks {
 export class RelayClient {
   private ws: WebSocket | null = null;
   private apiKey: string;
+  private apiKeyHash: string | null = null;
   private callbacks: RelayCallbacks;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
@@ -44,6 +46,7 @@ export class RelayClient {
   private ownPrivateKey: CryptoKey | null = null;
   private ownPublicJwk: JsonWebKey | null = null;
   private sharedKey: CryptoKey | null = null;
+  private keyExchangeComplete = false;
   private pendingOutbound: any[] = [];
   private pendingInbound: any[] = [];
   private minuteWindowStart = Date.now();
@@ -62,6 +65,7 @@ export class RelayClient {
     if (this.ws) { this.ws.close(); this.ws = null; }
 
     this.sharedKey = null;
+    this.keyExchangeComplete = false;
     this.pendingOutbound = [];
     this.pendingInbound = [];
 
@@ -86,20 +90,26 @@ export class RelayClient {
       }
 
       if (msg.type === 'relay.error') {
-        console.error('[Relay] Error:', msg.message);
+        console.error('[Relay] Error:', msg?.type || 'relay.error');
         return;
       }
 
       if (msg.type === 'relay.key_exchange' && msg.publicKey) {
         try {
           if (!this.ownPrivateKey) await this.startKeyExchange();
+          if (!this.apiKeyHash) this.apiKeyHash = await hashKey(this.apiKey);
+          if (!msg.keyHash || msg.keyHash !== this.apiKeyHash) {
+            console.warn('[Relay] Dropping key exchange with invalid key hash');
+            return;
+          }
           if (this.ownPrivateKey) {
             this.sharedKey = await deriveSharedKey(this.ownPrivateKey, msg.publicKey);
+            this.keyExchangeComplete = true;
             this.flushOutboundQueue();
             this.flushInboundQueue();
           }
-        } catch (e) {
-          console.error('[Relay] Key exchange failed:', e);
+        } catch {
+          console.error('[Relay] Key exchange failed');
         }
         return;
       }
@@ -108,6 +118,10 @@ export class RelayClient {
       if (!decrypted) return;
 
       if (decrypted.type === 'relay.send') {
+        if (this.keyExchangeComplete && !decrypted.encrypted) {
+          this.send({ type: 'relay.chat_error', message: 'Rejected plaintext relay.send after key exchange', id: decrypted.id || '' });
+          return;
+        }
         if (!this.consumeRateLimit()) {
           this.send({ type: 'relay.chat_error', message: 'Rate limit exceeded', id: decrypted.id || '' });
           return;
@@ -177,8 +191,8 @@ export class RelayClient {
       if (!this.destroyed) this.reconnectTimer = setTimeout(() => this.connect(), 5000);
     });
 
-    this.ws.addEventListener('error', (ev) => {
-      console.error('[Relay] WebSocket error:', ev);
+    this.ws.addEventListener('error', () => {
+      console.error('[Relay] WebSocket error');
     });
   }
 
@@ -209,8 +223,9 @@ export class RelayClient {
     const kp = await generateKeyPair();
     this.ownPrivateKey = kp.privateKey;
     this.ownPublicJwk = kp.publicKey;
+    if (!this.apiKeyHash) this.apiKeyHash = await hashKey(this.apiKey);
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'relay.key_exchange', publicKey: kp.publicKey, sourceNodeId: this.nodeId }));
+      this.ws.send(JSON.stringify({ type: 'relay.key_exchange', publicKey: kp.publicKey, keyHash: this.apiKeyHash, sourceNodeId: this.nodeId }));
     }
   }
 
@@ -255,7 +270,15 @@ export class RelayClient {
   }
 
   private async decryptPayload(msg: any): Promise<any | null> {
-    if (!msg?.encrypted) return msg;
+    if (!msg?.encrypted) {
+      if (this.keyExchangeComplete && SENSITIVE_INBOUND_TYPES.has(msg?.type)) {
+        if (msg?.type === 'relay.send') {
+          this.send({ type: 'relay.chat_error', message: 'Rejected plaintext relay.send after key exchange', id: msg.id || '' });
+        }
+        return null;
+      }
+      return msg;
+    }
     if (!this.sharedKey) {
       this.pendingInbound.push(msg);
       return null;
@@ -264,8 +287,8 @@ export class RelayClient {
       const plaintext = await decrypt(this.sharedKey, msg.encrypted);
       const parsed = JSON.parse(plaintext);
       return { ...msg, ...parsed, encrypted: undefined };
-    } catch (e) {
-      console.error('[Relay] Failed to decrypt payload:', e);
+    } catch {
+      console.error('[Relay] Failed to decrypt payload');
       return null;
     }
   }
@@ -288,13 +311,17 @@ export class RelayClient {
     this.encryptPayload(outboundBase)
       .then((enc) => {
         if (!enc) {
+          if (this.keyExchangeComplete && outboundBase?.type !== 'relay.key_exchange') {
+            console.warn('[RelayClient] Dropping plaintext message after key exchange:', outboundBase?.type);
+            return;
+          }
           this.pendingOutbound.push(msg);
           return;
         }
         console.log('[RelayClient] Sending:', enc.type);
         this.ws?.send(JSON.stringify(enc));
       })
-      .catch((e) => console.error('[RelayClient] Send failed:', e));
+      .catch(() => console.error('[RelayClient] Send failed'));
   }
 
   destroy() {
