@@ -3,10 +3,67 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
 import Image from "next/image";
-import { Send, Paperclip, Wifi, WifiOff } from "lucide-react";
+import { Send, Paperclip, Wifi, WifiOff, Loader2 } from "lucide-react";
 
 const RELAY_URL = "wss://overclaw-api-production.up.railway.app/ws/web";
+const PROXY_URL = "https://overclaw-api-production.up.railway.app";
 
+interface PreflightEstimate {
+  costExplanation: string;
+  plan: string;
+  estimatedInputTokens: number;
+  estimatedOutputTokens: number;
+  estimatedInternalTokens: number;
+}
+
+async function getPreflightEstimate(message: string, apiKey: string): Promise<PreflightEstimate> {
+  const prompt = `You are a task cost estimator for an AI assistant app. Given a user's task, estimate the cost in internal app tokens. Respond ONLY with valid JSON, no other text.
+
+Fields:
+- "costExplanation": One sentence explaining what this task will cost in simple terms
+- "plan": 2-3 sentences describing how the AI will approach this task
+- "estimatedInputTokens": estimated input tokens needed (integer)
+- "estimatedOutputTokens": estimated output tokens the response will use (integer)
+- "estimatedInternalTokens": calculated as ceil((estimatedInputTokens * 0.015) + (estimatedOutputTokens * 0.06))
+
+User task: ${message.slice(0, 500)}`;
+
+  try {
+    const resp = await fetch(`${PROXY_URL}/api/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: "overclaw/auto",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 300,
+      }),
+    });
+    if (!resp.ok) throw new Error(`Proxy ${resp.status}`);
+    const data = await resp.json();
+    const content = data.choices?.[0]?.message?.content || "{}";
+    // Extract JSON from response (handle markdown code blocks)
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : content);
+    return {
+      costExplanation: parsed.costExplanation || "This task will use a small amount of tokens.",
+      plan: parsed.plan || "The AI will process your request and respond.",
+      estimatedInputTokens: parsed.estimatedInputTokens || Math.ceil(message.length / 4),
+      estimatedOutputTokens: parsed.estimatedOutputTokens || Math.ceil(message.length / 2),
+      estimatedInternalTokens: parsed.estimatedInternalTokens || 1,
+    };
+  } catch (e) {
+    console.warn("[Chat] Preflight estimate failed:", e);
+    const inputEst = Math.ceil(message.length / 4);
+    const outputEst = Math.ceil(inputEst * 2);
+    return {
+      costExplanation: "This task will use a small amount of tokens.",
+      plan: "The AI will process your request and respond.",
+      estimatedInputTokens: inputEst,
+      estimatedOutputTokens: outputEst,
+      estimatedInternalTokens: Math.ceil((inputEst * 0.015) + (outputEst * 0.06)),
+    };
+  }
+}
 
 interface Message {
   id: string;
@@ -24,8 +81,13 @@ export default function ChatPage() {
   const [deviceState, setDeviceState] = useState<DeviceState>("connecting");
   const [userInitial, setUserInitial] = useState("U");
   const [userAvatar, setUserAvatar] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<null | { text: string; estimate: PreflightEstimate }>(null);
+  const [estimating, setEstimating] = useState(false);
+  const [thoughtText, setThoughtText] = useState("");
+  const [thoughtExpanded, setThoughtExpanded] = useState(false);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const apiKeyRef = useRef<string | null>(null);
 
   // Fetch user profile
   useEffect(() => {
@@ -72,6 +134,7 @@ export default function ChatPage() {
         }
         const { apiKey } = await resp.json();
         if (!apiKey || !mountedRef.current) { connectingRef.current = false; return; }
+        apiKeyRef.current = apiKey;
 
         const ws = new WebSocket(`${RELAY_URL}?key=${encodeURIComponent(apiKey)}`);
         wsRef.current = ws;
@@ -99,7 +162,8 @@ export default function ChatPage() {
               setDeviceState("offline");
               break;
             case "relay.chat_delta":
-              setStreamText(msg.text || "");
+              // Route deltas to thought box — only final goes in chat
+              setThoughtText(msg.text || "");
               setStreaming(true);
               break;
             case "relay.chat_final":
@@ -108,22 +172,27 @@ export default function ChatPage() {
               }
               setStreaming(false);
               setStreamText("");
+              setThoughtText("");
+              setThoughtExpanded(false);
               break;
             case "relay.chat_error":
               setMessages(prev => [...prev, { id: `e-${Date.now()}`, role: "assistant", content: `Error: ${msg.message}` }]);
               setStreaming(false);
               setStreamText("");
+              setThoughtText("");
+              setThoughtExpanded(false);
               break;
             case "relay.status":
               if (msg.status === "idle") {
-                // Capture any accumulated stream text as final message
-                setStreamText(prev => {
+                // Capture any accumulated thought text as final message
+                setThoughtText(prev => {
                   if (prev) {
                     setMessages(msgs => [...msgs, { id: `a-${Date.now()}`, role: "assistant", content: prev }]);
                   }
                   return "";
                 });
                 setStreaming(false);
+                setThoughtExpanded(false);
               }
               break;
             case "relay.history":
@@ -175,13 +244,25 @@ export default function ChatPage() {
     setInput("");
     setStreaming(true);
     setStreamText("");
+    setThoughtText("");
+    setThoughtExpanded(false);
     wsRef.current?.send(JSON.stringify({ type: "relay.send", text, id: Date.now().toString() }));
   }, []);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const text = input.trim();
-    if (!text || streaming || deviceState !== "online") return;
-    executeSend(text);
+    if (!text || streaming || estimating || deviceState !== "online") return;
+
+    setEstimating(true);
+    try {
+      const estimate = await getPreflightEstimate(text, apiKeyRef.current || "");
+      setPendingConfirm({ text, estimate });
+    } catch {
+      // If estimate fails, proceed directly
+      executeSend(text);
+    } finally {
+      setEstimating(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -256,16 +337,34 @@ export default function ChatPage() {
                 <div style={{ width: "32px", height: "32px", borderRadius: "10px", background: "var(--accent-bg-10)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                   <Image src="/logo.jpg" alt="" width={20} height={20} style={{ borderRadius: "5px" }} />
                 </div>
-                <div style={{
-                  padding: "12px 18px", borderRadius: "18px 18px 18px 4px",
-                  background: "var(--card-bg, rgba(255,255,255,0.03))", border: "1px solid var(--border)",
-                  fontSize: "14px", lineHeight: 1.6, minWidth: "60px", whiteSpace: "pre-wrap",
-                }}>
-                  {streamText || (
+                <div style={{ maxWidth: "75%", width: "100%" }}>
+                  {/* Loading spinner */}
+                  <div style={{
+                    padding: "12px 18px", borderRadius: "18px 18px 18px 4px",
+                    background: "var(--card-bg, rgba(255,255,255,0.03))", border: "1px solid var(--border)",
+                    display: "flex", alignItems: "center", gap: "8px",
+                  }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
                       <div className="typing-dot" style={{ animationDelay: "0ms" }} />
                       <div className="typing-dot" style={{ animationDelay: "150ms" }} />
                       <div className="typing-dot" style={{ animationDelay: "300ms" }} />
+                    </div>
+                  </div>
+                  {/* Thought/process box */}
+                  {thoughtText && (
+                    <div style={{ marginTop: "8px", borderRadius: "10px", overflow: "hidden", border: "1px solid var(--border)", background: "var(--card-bg, rgba(255,255,255,0.02))" }}>
+                      <button
+                        onClick={() => setThoughtExpanded(prev => !prev)}
+                        style={{ width: "100%", display: "flex", alignItems: "center", gap: "6px", padding: "8px 12px", fontSize: "11px", fontWeight: 500, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}
+                      >
+                        <span style={{ transform: thoughtExpanded ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s", display: "inline-block" }}>▶</span>
+                        Thinking &amp; Process
+                      </button>
+                      {thoughtExpanded && (
+                        <div style={{ padding: "0 12px 10px", fontSize: "11px", lineHeight: 1.6, whiteSpace: "pre-wrap", color: "var(--text-muted)", maxHeight: "200px", overflowY: "auto", fontFamily: "monospace" }}>
+                          {thoughtText}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -275,6 +374,45 @@ export default function ChatPage() {
           </div>
         )}
       </div>
+
+      {/* Preflight cost estimate modal */}
+      {pendingConfirm && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 80, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+          <div style={{ width: "100%", maxWidth: 440, borderRadius: 14, border: "1px solid var(--border)", background: "var(--card-bg, #111)", padding: 20 }}>
+            <h3 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", margin: 0 }}>Cost Estimate</h3>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 6, lineHeight: 1.5 }}>
+              {pendingConfirm.estimate.costExplanation}
+            </p>
+            <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 10, background: "rgba(255,255,255,0.03)", border: "1px solid var(--border)", fontSize: 12, lineHeight: 1.6, color: "var(--text-secondary)" }}>
+              <div style={{ fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>Plan</div>
+              {pendingConfirm.estimate.plan}
+            </div>
+            <div style={{ marginTop: 12, display: "flex", gap: 16, fontSize: 12, color: "var(--text-secondary)" }}>
+              <div>Input: <strong>{pendingConfirm.estimate.estimatedInputTokens}</strong></div>
+              <div>Output: <strong>{pendingConfirm.estimate.estimatedOutputTokens}</strong></div>
+              <div>Est. cost: <strong>{pendingConfirm.estimate.estimatedInternalTokens} tokens</strong></div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+              <button onClick={() => setPendingConfirm(null)} style={{ borderRadius: 8, border: "1px solid var(--border)", background: "transparent", color: "var(--text-secondary)", padding: "7px 14px", fontSize: 12, cursor: "pointer" }}>
+                Don&apos;t proceed
+              </button>
+              <button onClick={() => { const p = pendingConfirm; setPendingConfirm(null); if (p) executeSend(p.text); }} style={{ borderRadius: 8, border: "none", background: "var(--accent)", color: "#fff", padding: "7px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Estimating overlay */}
+      {estimating && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", zIndex: 80, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 20px", borderRadius: 12, background: "var(--card-bg, #111)", border: "1px solid var(--border)" }}>
+            <Loader2 size={14} className="animate-spin" style={{ color: "var(--accent)" }} />
+            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Estimating cost...</span>
+          </div>
+        </div>
+      )}
 
       {/* Input */}
       <div style={{ padding: "16px 20px 24px", flexShrink: 0 }}>
@@ -299,12 +437,12 @@ export default function ChatPage() {
             </button>
             <button
               onClick={handleSend}
-              disabled={!input.trim() || streaming || !online}
+              disabled={!input.trim() || streaming || estimating || !online}
               style={{
                 width: "32px", height: "32px", borderRadius: "10px", border: "none",
-                background: input.trim() && !streaming && online ? "var(--accent)" : "var(--border)",
-                color: input.trim() && !streaming && online ? "white" : "var(--text-muted)",
-                cursor: input.trim() && !streaming && online ? "pointer" : "not-allowed",
+                background: input.trim() && !streaming && !estimating && online ? "var(--accent)" : "var(--border)",
+                color: input.trim() && !streaming && !estimating && online ? "white" : "var(--text-muted)",
+                cursor: input.trim() && !streaming && !estimating && online ? "pointer" : "not-allowed",
                 display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.2s ease",
               }}
             >
