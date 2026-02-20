@@ -104,7 +104,7 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
 
 app.use((req, res, next) => {
   const isPublic =
-    (req.method === 'GET' && (req.path === '/health' || req.path === '/api/health')) ||
+    (req.method === 'GET' && (req.path === '/health' || req.path === '/api/health' || req.path === '/api/status')) ||
     (req.method === 'POST' && req.path === '/api/v1/chat/completions') ||
     (req.method === 'GET' && req.path === '/api/relay/nodes') ||
     req.path === '/install-agent.sh' ||
@@ -159,40 +159,13 @@ function streamCommand(command: string, cmd: string, args: string[], res: expres
 }
 
 // GET /api/status
-app.get('/api/status', async (_req, res) => {
-  try {
-    let installed = false;
-    let version: string | null = null;
-    let gateway: 'running' | 'stopped' | 'idle' = 'stopped';
-    let localUrl = 'http://127.0.0.1:18789';
-
-    try {
-      await runCommand('which', ['openclaw']);
-      installed = true;
-    } catch { /* not installed */ }
-
-    if (installed) {
-      try {
-        const v = await runCommand('openclaw', ['--version']);
-        version = v;
-      } catch { /* ignore */ }
-
-      try {
-        const s = await runCommand('openclaw', ['gateway', 'status']);
-        const lower = s.toLowerCase();
-        if (lower.includes('running')) gateway = 'running';
-        else if (lower.includes('idle')) gateway = 'idle';
-        else gateway = 'stopped';
-        // Try to extract URL
-        const urlMatch = s.match(/https?:\/\/[^\s]+/);
-        if (urlMatch) localUrl = urlMatch[0];
-      } catch { /* ignore */ }
-    }
-
-    res.json({ installed, version, gateway, localUrl });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
+app.get('/api/status', (_req, res) => {
+  res.json({
+    status: 'ok',
+    version: '0.2.0',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // POST /api/install

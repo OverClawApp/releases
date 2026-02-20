@@ -88479,7 +88479,7 @@ async function requireAuth(req, res, next) {
   }
 }
 app.use((req, res, next) => {
-  const isPublic = req.method === "GET" && (req.path === "/health" || req.path === "/api/health") || req.method === "POST" && req.path === "/api/v1/chat/completions" || req.method === "GET" && req.path === "/api/relay/nodes" || req.path === "/install-agent.sh" || req.path.startsWith("/ws") || req.path.startsWith("/public/") || req.path === "/api/stripe/webhook";
+  const isPublic = req.method === "GET" && (req.path === "/health" || req.path === "/api/health" || req.path === "/api/status") || req.method === "POST" && req.path === "/api/v1/chat/completions" || req.method === "GET" && req.path === "/api/relay/nodes" || req.path === "/install-agent.sh" || req.path.startsWith("/ws") || req.path.startsWith("/public/") || req.path === "/api/stripe/webhook";
   if (isPublic) return next();
   return requireAuth(req, res, next);
 });
@@ -88522,38 +88522,13 @@ function streamCommand(command, cmd, args, res) {
   });
   res.json({ ok: true, message: `${command} started` });
 }
-app.get("/api/status", async (_req, res) => {
-  try {
-    let installed = false;
-    let version3 = null;
-    let gateway = "stopped";
-    let localUrl = "http://127.0.0.1:18789";
-    try {
-      await runCommand("which", ["openclaw"]);
-      installed = true;
-    } catch {
-    }
-    if (installed) {
-      try {
-        const v = await runCommand("openclaw", ["--version"]);
-        version3 = v;
-      } catch {
-      }
-      try {
-        const s = await runCommand("openclaw", ["gateway", "status"]);
-        const lower = s.toLowerCase();
-        if (lower.includes("running")) gateway = "running";
-        else if (lower.includes("idle")) gateway = "idle";
-        else gateway = "stopped";
-        const urlMatch = s.match(/https?:\/\/[^\s]+/);
-        if (urlMatch) localUrl = urlMatch[0];
-      } catch {
-      }
-    }
-    res.json({ installed, version: version3, gateway, localUrl });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.get("/api/status", (_req, res) => {
+  res.json({
+    status: "ok",
+    version: "0.2.0",
+    uptime: process.uptime(),
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  });
 });
 app.post("/api/install", (_req, res) => {
   streamCommand("install", "npm", ["install", "-g", "openclaw"], res);
