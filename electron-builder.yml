@@ -18,6 +18,7 @@ mac:
   target:
     - dmg
     - zip
+  artifactName: "${productName}-${version}-${arch}.${ext}"
   hardenedRuntime: true
   gatekeeperAssess: false
   entitlements: build/entitlements.mac.plist
@@ -38,6 +39,7 @@ linux:
   icon: build/icon.png
   target:
     - AppImage
+  artifactName: "${productName}-${version}-${arch}.${ext}"
   category: Development
   maintainer: OverClaw <support@overclaw.app>
 
