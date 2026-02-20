@@ -1576,14 +1576,15 @@ wssWeb.on('connection', (ws, req) => {
     if (!authenticated || !userId) return;
 
     if (msg.type?.startsWith('relay.')) {
+      const outbound = { ...msg, sourceNodeId: msg.sourceNodeId || 'web' };
       // Node-targeted web->device route (backward-compatible broadcast)
-      if (msg.targetNodeId) {
-        const delivered = sendToDeviceNode(userId, msg.targetNodeId, msg);
+      if (outbound.targetNodeId) {
+        const delivered = sendToDeviceNode(userId, outbound.targetNodeId, outbound);
         if (!delivered) {
-          ws.send(JSON.stringify({ type: 'relay.error', message: `Target node offline: ${msg.targetNodeId}` }));
+          ws.send(JSON.stringify({ type: 'relay.error', message: `Target node offline: ${outbound.targetNodeId}` }));
         }
       } else {
-        sendToAllDeviceNodes(userId, msg);
+        sendToAllDeviceNodes(userId, outbound);
       }
     }
   });
