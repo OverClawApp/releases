@@ -1,4 +1,4 @@
-require('@sentry/electron/preload')
+try { require('@sentry/electron/preload') } catch (e) { /* Sentry preload skipped */ }
 
 const { contextBridge, ipcRenderer } = require('electron')
 
