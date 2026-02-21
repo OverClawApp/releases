@@ -684,6 +684,25 @@ export default function CloudPage() {
             const ws = wsRequestRef.current
             if (!ws) { console.warn('[Relay] No WS for task scheduling'); return }
             console.log(`[Relay] Scheduling ${tasks.length} tasks for project: ${projectName}`)
+
+            // Estimate total project cost upfront
+            try {
+              const { getPreflightEstimate: estimate } = await import('../components/GatewayChat')
+              const allDescs = tasks.map(t => `${t.title}: ${t.description}`).join('\n')
+              const projectEst = await estimate(`Project with ${tasks.length} tasks:\n${allDescs.slice(0, 1000)}`, apiKey)
+              const HIGH_PROJECT_THRESHOLD = 100
+              if (projectEst.estimatedInternalTokens >= HIGH_PROJECT_THRESHOLD) {
+                const proceed = window.confirm(
+                  `Project "${projectName}" cost estimate:\n\n` +
+                  `${projectEst.costExplanation}\n` +
+                  `Tasks: ${tasks.length}\n` +
+                  `Est. tokens: ~${projectEst.estimatedInternalTokens}\n\n` +
+                  `Proceed?`
+                )
+                if (!proceed) return
+              }
+            } catch { /* estimate failed, proceed anyway */ }
+
             // Sort tasks by dependency order, then schedule sequentially
             const sorted = [...tasks].sort((a, b) => a.index - b.index)
             let delayMs = 0
@@ -1117,6 +1136,11 @@ export default function CloudPage() {
       addLine('output', '')
       addLine('output', '✅ Installation complete!')
 
+      // Bootstrap default OpenClaw config so launchd gateway service doesn't crash on fresh machines
+      try {
+        await api().exec('openclaw', ['setup', '--mode', 'local', '--non-interactive'], { timeout: 120000 })
+      } catch {}
+
       await fetchStatus()
       setTimeout(() => setFlow('setup'), 1000)
     } catch (err: any) {
@@ -1131,6 +1155,9 @@ export default function CloudPage() {
           await api().exec('openclaw', ['--version'])
           addLine('output', '')
           addLine('output', '✅ Installation complete!')
+          try {
+            await api().exec('openclaw', ['setup', '--mode', 'local', '--non-interactive'], { timeout: 120000 })
+          } catch {}
           await fetchStatus()
           setTimeout(() => setFlow('setup'), 1000)
           return
@@ -1463,6 +1490,7 @@ ${teamSection}`
                 onClearChat={() => clearChatRef.current?.()}
                 stateDir={cloudStateDir}
                 port={cloudPort}
+                apiKey={proxyApiKey}
               />
             ) : (
               <SubAgentsPanel

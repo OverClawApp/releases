@@ -442,6 +442,11 @@ export default function LocalPage() {
       addLine('output', '')
       addLine('output', '✅ Installation complete!')
 
+      // Bootstrap default OpenClaw config so launchd gateway service doesn't crash on fresh machines
+      try {
+        await window.electronAPI!.exec('openclaw', ['setup', '--mode', 'local', '--non-interactive'], { timeout: 120000 })
+      } catch {}
+
       await fetchStatus()
       setTimeout(() => setFlow('setup'), 1000)
     } catch (err: any) {

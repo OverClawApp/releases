@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { Clock, Play, CheckCircle2, Zap, RefreshCw, Terminal, Trash2, Globe, Cpu, FileText, X, Check, Loader2, Package, Search, Download, ChevronRight, Plus, Calendar, Repeat, Timer, MessageSquare, Bot, Pause, Eye } from 'lucide-react'
+import { Clock, Play, CheckCircle2, Zap, RefreshCw, Terminal, Trash2, Globe, Cpu, FileText, X, Check, Loader2, Package, Search, Download, ChevronRight, Plus, Calendar, Repeat, Timer, MessageSquare, Bot, Pause, Eye, Coins } from 'lucide-react'
+import { getPreflightEstimate, type PreflightEstimate } from './GatewayChat'
 
 const isElectron = !!window.electronAPI?.isElectron
 const isWin = (window.electronAPI?.platform || navigator.platform) === 'win32'
@@ -610,11 +611,12 @@ interface TaskAttachment {
   fileName: string
 }
 
-function NewTaskModal({ open, onClose, wsRequest, stateDir }: {
+function NewTaskModal({ open, onClose, wsRequest, stateDir, apiKey }: {
   open: boolean
   onClose: () => void
   wsRequest: (method: string, params: any) => Promise<any>
   stateDir?: string
+  apiKey?: string
 }) {
   const [name, setName] = useState('')
   const [scheduleKind, setScheduleKind] = useState<ScheduleKind>('every')
@@ -629,6 +631,25 @@ function NewTaskModal({ open, onClose, wsRequest, stateDir }: {
   const [error, setError] = useState<string | null>(null)
   const [attachments, setAttachments] = useState<TaskAttachment[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [taskEstimate, setTaskEstimate] = useState<PreflightEstimate | null>(null)
+  const [estimatingTask, setEstimatingTask] = useState(false)
+  const estimateTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Debounced estimate when message changes (cloud mode only)
+  useEffect(() => {
+    if (estimateTimer.current) clearTimeout(estimateTimer.current)
+    setTaskEstimate(null)
+    if (!apiKey || !message.trim() || message.trim().length < 20) return
+    estimateTimer.current = setTimeout(async () => {
+      setEstimatingTask(true)
+      try {
+        const est = await getPreflightEstimate(message.trim(), apiKey)
+        setTaskEstimate(est)
+      } catch { /* ignore */ }
+      setEstimatingTask(false)
+    }, 1500)
+    return () => { if (estimateTimer.current) clearTimeout(estimateTimer.current) }
+  }, [message, apiKey])
 
   useEffect(() => {
     if (open) { setName(''); setMessage(''); setError(null); setSaving(false); setAttachments([]) }
@@ -904,6 +925,36 @@ function NewTaskModal({ open, onClose, wsRequest, stateDir }: {
             </p>
           </div>
 
+          {/* Cost Estimate */}
+          {(taskEstimate || estimatingTask) && (
+            <div className="rounded-lg px-3 py-2.5" style={{ background: 'var(--bg-page)', border: '1px solid var(--border-color)' }}>
+              <div className="flex items-center gap-1.5 mb-1">
+                <Coins size={11} style={{ color: 'var(--accent-teal)' }} />
+                <span className="text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>Estimated Cost</span>
+              </div>
+              {estimatingTask ? (
+                <div className="flex items-center gap-1.5">
+                  <Loader2 size={10} className="animate-spin" style={{ color: 'var(--text-muted)' }} />
+                  <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Estimating...</span>
+                </div>
+              ) : taskEstimate && (
+                <>
+                  <p className="text-[10px] mb-1" style={{ color: 'var(--text-muted)' }}>{taskEstimate.costExplanation}</p>
+                  <div className="flex items-center gap-3 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
+                    <span>Input: <strong>{taskEstimate.estimatedInputTokens}</strong></span>
+                    <span>Output: <strong>{taskEstimate.estimatedOutputTokens}</strong></span>
+                    <span>Est: <strong>{taskEstimate.estimatedInternalTokens} tokens</strong></span>
+                    {scheduleKind === 'every' && (
+                      <span style={{ color: 'var(--accent-yellow, #d29a22)' }}>
+                        ~{Math.round(taskEstimate.estimatedInternalTokens * (86400000 / everyMs))}/day
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
           {error && <p className="text-[11px]" style={{ color: '#f85149' }}>{error}</p>}
         </div>
 
@@ -933,9 +984,10 @@ interface TasksPanelProps {
   stateDir?: string // e.g. '~/.overclaw/local' — if set, prefixes openclaw commands with OPENCLAW_STATE_DIR
   port?: number
   hideSkills?: boolean
+  apiKey?: string
 }
 
-export default function TasksPanel({ gatewayUrl, gatewayToken, wsRequest, onClearChat, stateDir, port = 18789, hideSkills }: TasksPanelProps) {
+export default function TasksPanel({ gatewayUrl, gatewayToken, wsRequest, onClearChat, stateDir, port = 18789, hideSkills, apiKey }: TasksPanelProps) {
   const [actionStatus, setActionStatus] = useState<string | null>(null)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [newTaskOpen, setNewTaskOpen] = useState(false)
@@ -1262,6 +1314,7 @@ export default function TasksPanel({ gatewayUrl, gatewayToken, wsRequest, onClea
         onClose={() => { setNewTaskOpen(false); loadCronJobs() }}
         wsRequest={wsRequest}
         stateDir={stateDir}
+        apiKey={apiKey}
       />
 
       {/* Response Viewer Modal */}

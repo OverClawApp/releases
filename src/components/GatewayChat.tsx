@@ -164,7 +164,7 @@ function extractText(content: any): string | null {
 
 const PROXY_URL = 'https://overclaw-api-production.up.railway.app'
 
-interface PreflightEstimate {
+export interface PreflightEstimate {
   costExplanation: string
   plan: string
   estimatedInputTokens: number
@@ -172,7 +172,7 @@ interface PreflightEstimate {
   estimatedInternalTokens: number
 }
 
-async function getPreflightEstimate(message: string, apiKey: string): Promise<PreflightEstimate> {
+export async function getPreflightEstimate(message: string, apiKey: string): Promise<PreflightEstimate> {
   const prompt = `You are a task cost estimator for an AI assistant app. Given a user's task, estimate the cost in internal app tokens. Respond ONLY with valid JSON, no other text.
 
 Fields:
@@ -825,11 +825,17 @@ export default function GatewayChat({ gatewayUrl = 'ws://localhost:18789', gatew
       setInput(''); return
     }
 
-    // Get real estimate from lightweight model
+    // Get real estimate from lightweight model — only show modal if high token usage
     setEstimating(true)
     try {
       const estimate = await getPreflightEstimate(text || currentAttachments.map(a => a.fileName).join(' '), apiKey || '')
-      setPendingConfirm({ text, attachments: currentAttachments, estimate })
+      const HIGH_TOKEN_THRESHOLD = 50 // internal tokens
+      if (estimate.estimatedInternalTokens >= HIGH_TOKEN_THRESHOLD) {
+        setPendingConfirm({ text, attachments: currentAttachments, estimate })
+      } else {
+        // Low cost — skip confirmation, send directly
+        await executeSend(text, currentAttachments)
+      }
     } catch (e) {
       console.warn('[GatewayChat] Estimate failed, proceeding directly:', e)
       await executeSend(text, currentAttachments)
